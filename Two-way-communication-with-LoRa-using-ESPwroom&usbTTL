@@ -1,0 +1,76 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <SPI.h>
+
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+
+#define LORA_RX 16
+#define LORA_TX 17
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+HardwareSerial LoRaSerial(1);  // UART1
+
+String incomingMsg = "";
+String outgoingMsg = "";
+
+String extractMessage(String raw) {
+  int first = raw.indexOf(',');
+  int second = raw.indexOf(',', first + 1);
+  int third = raw.indexOf(',', second + 1);
+  return raw.substring(second + 1, third);
+}
+
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+
+  tft.begin();
+  tft.setSPISpeed(10000000);
+  tft.writeCommand(ILI9341_SWRESET);
+  delay(150);
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(3);
+  tft.setCursor(30, 30);
+  tft.println("LoRa Chat");
+
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 70);
+  tft.println("Listening...");
+}
+
+void loop() {
+  // Check for LoRa message
+  if (LoRaSerial.available()) {
+    String raw = LoRaSerial.readStringUntil('\n');
+    if (raw.startsWith("+RCV")) {
+      incomingMsg = extractMessage(raw);
+      Serial.println("Received: " + incomingMsg);
+
+      tft.fillRect(0, 110, 240, 40, ILI9341_BLACK);
+      tft.setCursor(10, 120);
+      tft.setTextColor(ILI9341_YELLOW);
+      tft.print("From LoRa: ");
+      tft.println(incomingMsg);
+    }
+  }0
+
+  // Check for user input from Serial Monitor
+  if (Serial.available()) {
+    outgoingMsg = Serial.readStringUntil('\n');
+    String command = "AT+SEND=0," + String(outgoingMsg.length()) + "," + outgoingMsg;
+    LoRaSerial.println(command);
+    Serial.println("Sent: " + outgoingMsg);
+
+    tft.fillRect(0, 170, 240, 40, ILI9341_BLACK);
+    tft.setCursor(10, 180);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.print("You: ");
+    tft.println(outgoingMsg);
+  }
+}
