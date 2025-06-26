@@ -1,0 +1,60 @@
+//RX:(in this case WROOM)
+#include <HardwareSerial.h>
+HardwareSerial LoRaSerial(1);
+
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(115200, SERIAL_8N1, 4, 5);      //CONNECT RX OF LORA TO 5 AND TX TO 4
+  Serial.println("Listening for LoRa packets...");
+  delay(2000); // Let LoRa boot
+}
+
+void loop() {
+  if (LoRaSerial.available()) {
+    String msg = LoRaSerial.readStringUntil('\n');
+    msg.trim();
+    Serial.println("📨 Incoming: " + msg);
+
+    if (msg.startsWith("+RCV")) {
+      int lastComma = msg.lastIndexOf(',');
+      if (lastComma != -1) {
+        String rssi = msg.substring(lastComma + 1);
+        Serial.println("📶 RSSI: " + rssi);
+      }
+    }
+  }
+}
+//TX:(IN THIS CASE DEV)
+#define LORA_RX 16  // LoRa TX → ESP32 RX2
+#define LORA_TX 17  // LoRa RX → ESP32 TX2
+
+HardwareSerial LoRaSerial(2);  // Using UART2 for LoRa
+
+void setup() {
+  Serial.begin(115200);  // USB Serial Monitor
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);  // LoRa UART
+
+  Serial.println("====== Reyax LoRa AT Command Terminal ======");
+  Serial.println("📡 Type AT commands below (e.g., AT, AT+ADDRESS=1, AT+SEND=2,5,Hello)");
+  Serial.println("💡 Make sure 'Both NL & CR' is selected in Serial Monitor");
+}
+
+void loop() {
+  // Forward typed command to LoRa
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();  // Remove accidental leading/trailing spaces
+    if (input.length() > 0) {
+      LoRaSerial.println(input);  // Send to LoRa module
+    }
+  }
+
+  // Print LoRa response to Serial Monitor
+  if (LoRaSerial.available()) {
+    String response = LoRaSerial.readStringUntil('\n');
+    response.trim();
+    if (response.length() > 0) {
+      Serial.println("LoRa → " + response);
+    }
+  }
+}
