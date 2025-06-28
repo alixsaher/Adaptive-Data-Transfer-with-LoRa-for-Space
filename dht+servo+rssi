@@ -1,0 +1,43 @@
+TX:
+#include <HardwareSerial.h>
+#include <dht.h>
+
+HardwareSerial LoRaSerial(1);
+
+#define DHTPIN 2
+#define DHTTYPE DHT11
+
+DHT dht(DHTPIN, DHTTYPE);
+
+#define LORA_TX 17
+#define LORA_RX 16
+
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  Serial.println("🚀 LoRa TX Started");
+  delay(2000); // Wait for LoRa module to initialize
+
+  LoRaSerial.println("AT+ADDRESS=9");
+  delay(500);
+
+  dht.begin();
+}
+
+void loop() {
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("⚠️ Failed to read from DHT sensor!");
+    return;
+  }
+
+  String message = "T:" + String(temperature) + " H:" + String(humidity);
+  String atCommand = "AT+SEND=18," + String(message.length()) + "," + message;
+
+  LoRaSerial.println(atCommand);
+  Serial.println("📤 Sent: " + message);
+
+  delay(2000);
+}
