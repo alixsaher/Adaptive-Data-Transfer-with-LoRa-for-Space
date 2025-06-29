@@ -1,0 +1,126 @@
+\\TX connected to dev addr=9
+#include <HardwareSerial.h>
+#include <DHT.h>
+
+HardwareSerial LoRaSerial(1);
+
+#define DHTPIN 2
+#define DHTTYPE DHT11
+
+DHT dht(DHTPIN, DHTTYPE);
+
+#define LORA_TX 17
+#define LORA_RX 16
+
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  Serial.println("🚀 LoRa TX Started");
+  delay(2000); // Wait for LoRa module to initialize
+
+  LoRaSerial.println("AT+ADDRESS=9");
+  delay(500);
+
+  dht.begin();
+}
+
+void loop() {
+  float temperature = dht.readTemperature();
+  float humidity = dht.readHumidity();
+
+  if (isnan(temperature) || isnan(humidity)) {
+    Serial.println("⚠ Failed to read from DHT sensor!");
+    return;
+  }
+
+  String message = "T:" + String(temperature) + " H:" + String(humidity);
+  String atCommand = "AT+SEND=12," + String(message.length()) + "," + message;
+
+  LoRaSerial.println(atCommand);
+  Serial.println("📤 Sent: " + message);
+
+  delay(2000);
+}
+
+--------------------------------------------------------------------------------------------------------------
+
+\\RX connected to wroom addr=12
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+
+HardwareSerial LoRaSerial(1);
+Servo antennaServo;
+
+// === Pin Configuration ===
+#define SERVO_PIN 13       // Servo control pin
+
+// === Servo Scan Settings ===
+const int stepAngle = 15;        // Degrees per step
+const int scanDelay = 3000;      // Wait per angle to receive LoRa
+int bestRSSI = -999;
+int bestAngle = 0;
+
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(115200, SERIAL_8N1, 4, 5);   // LoRa TX to GPIO4, RX to GPIO5
+  antennaServo.attach(SERVO_PIN);
+
+  Serial.println("🚀 Starting Initial RSSI Scan...");
+  delay(2000); // Let LoRa module boot
+
+  // === One-time Scan ===
+  for (int angle = 0; angle <= 180; angle += stepAngle) {
+    antennaServo.write(angle);
+    Serial.println("🔄 Scanning Angle: " + String(angle));
+    delay(scanDelay);  // Wait for packet
+
+    String msg = "";
+    unsigned long timeout = millis() + 2500;
+    while (millis() < timeout) {
+      if (LoRaSerial.available()) {
+        msg = LoRaSerial.readStringUntil('\n');
+        msg.trim();
+        Serial.println("📩 " + msg);
+
+        // === Accurate +RCV Parsing ===
+        if (msg.startsWith("+RCV")) {
+          int commas[5];
+          int count = 0;
+          for (int i = 0; i < msg.length(); i++) {
+            if (msg.charAt(i) == ',') {
+              commas[count++] = i;
+              if (count == 4) break;
+            }
+          }
+
+          if (count >= 4) {
+            String rssiStr = msg.substring(commas[2] + 1, commas[3]);
+            int rssi = rssiStr.toInt();
+            Serial.println("📶 RSSI: " + String(rssi));
+
+            if (rssi > bestRSSI) {
+              bestRSSI = rssi;
+              bestAngle = angle;
+              Serial.println("✅ New Best: " + String(bestRSSI) + " at " + String(bestAngle) + "°");
+            }
+          }
+
+          break; // Exit timeout loop after successful parse
+        }
+      }
+    }
+  }
+
+  // === Lock to Best Angle ===
+  antennaServo.write(bestAngle);
+  Serial.println("🏁 Best Angle Locked: " + String(bestAngle) + "° | Best RSSI: " + String(bestRSSI));
+}
+
+void loop() {
+  // === Keep Receiving LoRa Data ===
+  if (LoRaSerial.available()) {
+    String msg = LoRaSerial.readStringUntil('\n');
+    msg.trim();
+    Serial.println("📩 " + msg);
+  }
+}
