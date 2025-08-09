@@ -1,0 +1,61 @@
+#include "esp_camera.h"
+#include "FS.h"
+#include "SD_MMC.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+// Replace with your network credentials
+const char* ssid = "Airtel";
+const char* password = "saherali";
+
+WebServer server(80);
+
+// Image file path on SD card (update extension if not .jpg)
+const char* imagePath = "/pictures/Testimage.jpg";
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize SD card
+  if(!SD_MMC.begin()){
+    Serial.println("SD Card Mount Failed");
+    return;
+  }
+
+  // Connect to Wi-Fi
+  WiFi.begin(ssid, password);
+  Serial.println("Connecting to WiFi...");
+  while(WiFi.status() != WL_CONNECTED){
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println();
+  Serial.print("Connected to WiFi. IP: ");
+  Serial.println(WiFi.localIP());
+
+  // Define handler for root: serve an HTML page displaying the image
+  server.on("/", HTTP_GET, [](){
+    String html = "<html><body><h1>ESP32-CAM SD Card Image</h1>";
+    html += "<img src=\"/image\" style=\"width:90%;height:auto;\"/>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  // Define handler to serve the image file
+  server.on("/image", HTTP_GET, [](){
+    if(SD_MMC.exists(imagePath)){
+      File imgFile = SD_MMC.open(imagePath, FILE_READ);
+      server.streamFile(imgFile, "image/jpeg");
+      imgFile.close();
+    } else {
+      server.send(404, "text/plain", "Image not found");
+    }
+  });
+
+  server.begin();
+  Serial.println("HTTP server started");
+}
+
+void loop() {
+  server.handleClient();
+}
