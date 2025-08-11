@@ -17,6 +17,7 @@ To develop and simulate a LoRa-based communication system for space and space-li
 
 ## 🔧 Components Used
 - ESP32-WROOM
+- ESP-32 DEV Module
 - Reyax LoRa modules
 - DHT11 sensor
 - Servo Motor
