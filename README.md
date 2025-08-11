@@ -12,6 +12,7 @@ To develop and simulate a LoRa-based communication system for space and space-li
 - TFT display for receiver-side monitoring
 - Adaptive three modes to extend life
 - ESP-cam to capture real-time images
+- ESP-cam chunks images and sends them to the TX MCU via TCP using WiFiClient and WiFiServer
 - Secondary memory to safegaurd important data incase of communication failure
 
 ## 🔧 Components Used
