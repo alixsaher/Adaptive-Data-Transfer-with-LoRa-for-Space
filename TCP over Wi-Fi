@@ -1,0 +1,168 @@
+//ESP CAM CODE
+#include "FS.h"
+#include "SD_MMC.h"
+#include <WiFi.h>
+
+const char* ssid = "Airtel";
+const char* password = "saherali";
+
+const char* serverIP = "192.168.1.28"; // Receiver ESP IP
+const uint16_t serverPort = 5000;
+
+#define CHUNK_SIZE 1024  // bytes per chunk
+
+void setup() {
+  Serial.begin(115200);
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  if (!SD_MMC.begin()) {
+    Serial.println("SD Card Mount Failed");
+    return;
+  }
+
+  File file = SD_MMC.open("/pictures/Testimage.jpg", FILE_READ);
+  if (!file) {
+    Serial.println("Failed to open image file");
+    return;
+  }
+
+  WiFiClient client;
+  Serial.println("Connecting to receiver...");
+  if (!client.connect(serverIP, serverPort)) {
+    Serial.println("Connection failed");
+    file.close();
+    return;
+  }
+  Serial.println("Connected to receiver");
+
+  uint32_t fileSize = file.size();
+  uint32_t totalChunks = (fileSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+  client.write((uint8_t*)&fileSize, sizeof(fileSize));
+
+  Serial.printf("Sending file of size %u bytes...\n", fileSize);
+  Serial.printf("Chunk size: %u bytes, Total chunks: %u\n", CHUNK_SIZE, totalChunks);
+
+  uint8_t buffer[CHUNK_SIZE];
+  uint32_t chunkCount = 0;
+  while (file.available()) {
+    size_t bytesRead = file.read(buffer, CHUNK_SIZE);
+    client.write(buffer, bytesRead);
+    chunkCount++;
+    Serial.printf("Sent chunk %u/%u (%u bytes)\n", chunkCount, totalChunks, bytesRead);
+  }
+
+  Serial.println("File sent successfully");
+  file.close();
+  client.stop();
+}
+
+void loop() {
+  // Nothing
+}
+
+
+------------------------------------------------------------------------------------------------------------------
+
+
+//ESP-DEV TX 
+#include "FS.h"
+#include "SPIFFS.h"
+#include <WiFi.h>
+#include <WebServer.h>
+
+const char* ssid = "YOUR_WIFI_SSID";
+const char* password = "YOUR_WIFI_PASS";
+
+WebServer server(80);
+WiFiServer tcpServer(5000);
+
+#define CHUNK_SIZE 1024 // must match sender
+
+void setup() {
+  Serial.begin(115200);
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println("\nConnected to WiFi");
+  Serial.print("IP: "); Serial.println(WiFi.localIP());
+
+  tcpServer.begin();
+  Serial.println("TCP server started on port 5000");
+
+  server.on("/", HTTP_GET, [](){
+    String html = "<html><body><h1>Received Image</h1>";
+    html += "<img src=\"/image\" style=\"width:90%;height:auto;\"/>";
+    html += "</body></html>";
+    server.send(200, "text/html", html);
+  });
+
+  server.on("/image", HTTP_GET, [](){
+    if (SPIFFS.exists("/received.jpg")) {
+      File imgFile = SPIFFS.open("/received.jpg", FILE_READ);
+      server.streamFile(imgFile, "image/jpeg");
+      imgFile.close();
+    } else {
+      server.send(404, "text/plain", "Image not found");
+    }
+  });
+
+  server.begin();
+}
+
+void loop() {
+  server.handleClient();
+
+  WiFiClient client = tcpServer.available();
+  if (client) {
+    Serial.println("Client connected, receiving file...");
+    
+    uint32_t fileSize;
+    client.readBytes((char*)&fileSize, sizeof(fileSize));
+    Serial.printf("Incoming file size: %u bytes\n", fileSize);
+
+    uint32_t totalChunks = (fileSize + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    Serial.printf("Expected chunk size: %u bytes, Total chunks: %u\n", CHUNK_SIZE, totalChunks);
+
+    File file = SPIFFS.open("/received.jpg", FILE_WRITE);
+    if (!file) {
+      Serial.println("Failed to create file");
+      client.stop();
+      return;
+    }
+
+    uint8_t buffer[CHUNK_SIZE];
+    uint32_t totalReceived = 0;
+    uint32_t chunkCount = 0;
+
+    while (totalReceived < fileSize) {
+      size_t bytesRead = client.read(buffer, sizeof(buffer));
+      if (bytesRead > 0) {
+        file.write(buffer, bytesRead);
+        totalReceived += bytesRead;
+        chunkCount++;
+        Serial.printf("Received chunk %u/%u (%u bytes)\n", chunkCount, totalChunks, bytesRead);
+      }
+    }
+
+    file.close();
+    client.stop();
+    Serial.println("File received and saved to SPIFFS");
+  }
+}
