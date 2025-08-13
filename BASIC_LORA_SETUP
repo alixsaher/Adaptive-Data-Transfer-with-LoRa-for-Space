@@ -21,3 +21,34 @@ void loop() {
     Serial.write(c);   // Show on Serial Monitor
   }
 }
+
+
+-------------------------------------------------------------------------------------------------------------------------------------
+
+
+//for wroom use 4 and 5
+
+
+#define LORA_RX 4  // LoRa TX → ESP32 gpio4
+#define LORA_TX 5  // LoRa RX ← ESP32 gpio5
+
+void setup() {
+  Serial.begin(115200);                       // Serial Monitor
+  Serial2.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);  // LoRa UART
+  Serial.println(">>> LoRa Serial Bridge Ready <<<");
+  Serial.println("Type AT commands below:");
+}
+
+void loop() {
+  // PC → LoRa
+  if (Serial.available()) {
+    char c = Serial.read();
+    Serial2.write(c);  // Send to LoRa module
+  }
+
+  // LoRa → PC
+  if (Serial2.available()) {
+    char c = Serial2.read();
+    Serial.write(c);   // Show on Serial Monitor
+  }
+}
