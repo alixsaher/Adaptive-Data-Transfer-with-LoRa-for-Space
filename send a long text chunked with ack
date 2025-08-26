@@ -1,0 +1,112 @@
+//tx(WROOM):
+#include <HardwareSerial.h>
+HardwareSerial loraSerial(2);  // UART2
+
+String longMessage = "This is a very long text string that we will break down into smaller chunks and send piece by piece using LoRa with ACK after every chunk.";
+int chunkSize = 20;  // max chars per packet
+int currentIndex = 0;
+bool waitingAck = false;
+bool finished = false;
+
+void setup() {
+  Serial.begin(115200);
+  loraSerial.begin(115200, SERIAL_8N1, 4, 5);
+
+  delay(2000);
+  Serial.println("TX Ready");
+
+  // Set local address = 7
+  loraSerial.println("AT+ADDRESS=7");
+  delay(100);
+  // Set destination address = 12
+  loraSerial.println("AT+DESTINATION=12");
+  delay(100);
+}
+
+void loop() {
+  if (!waitingAck && !finished) {
+    if (currentIndex < longMessage.length()) {
+      // Take a chunk
+      String chunk = longMessage.substring(currentIndex, currentIndex + chunkSize);
+      currentIndex += chunkSize;
+
+      // Send chunk
+      int len = chunk.length();
+      String cmd = "AT+SEND=12," + String(len) + "," + chunk;
+      loraSerial.println(cmd);
+      Serial.println("Sent chunk: " + chunk);
+
+      waitingAck = true;  // wait for ACK before sending next
+    } else {
+      // All chunks sent → send END marker once
+      loraSerial.println("AT+SEND=12,3,END");
+      Serial.println("Sent: END");
+      finished = true;
+    }
+  }
+
+  // Check for ACK
+  if (loraSerial.available()) {
+    String resp = loraSerial.readStringUntil('\n');
+    resp.trim();
+    if (resp.indexOf("ACK") >= 0) {
+      Serial.println("Got ACK, sending next...");
+      waitingAck = false;  // allow next chunk
+    }
+  }
+}
+
+
+---------------------------------------------------------------------------------------------------------------
+//RX(DEV):
+#include <HardwareSerial.h>
+HardwareSerial loraSerial(2);  // UART2
+
+String fullMessage = "";  // buffer for complete message
+
+void setup() {
+  Serial.begin(115200);
+  loraSerial.begin(115200, SERIAL_8N1, 16, 17);
+
+  delay(2000);
+  Serial.println("RX Ready");
+
+  // Set local address = 12
+  loraSerial.println("AT+ADDRESS=12");
+  delay(100);
+}
+
+void loop() {
+  if (loraSerial.available()) {
+    String msg = loraSerial.readStringUntil('\n');
+    msg.trim();
+
+    // Only process real received packets
+    if (msg.startsWith("+RCV")) {
+      // Format: +RCV=7,20,Hello World,-45,9
+      int firstComma = msg.indexOf(',');
+      int secondComma = msg.indexOf(',', firstComma + 1);
+      int thirdComma = msg.indexOf(',', secondComma + 1);
+
+      String payload = msg.substring(secondComma + 1, thirdComma);
+      payload.trim();
+
+      if (payload == "END") {
+        // Print reconstructed message
+        Serial.println("---- Full message reconstructed ----");
+        Serial.println(fullMessage);
+        Serial.println("------------------------------------");
+        fullMessage = "";  // reset buffer
+      } else {
+        // Append chunk
+        fullMessage += payload;
+        Serial.println("Received chunk: " + payload);
+      }
+
+      // Always send ACK
+      loraSerial.println("AT+SEND=7,3,ACK");
+      Serial.println("Sent: ACK");
+      delay(200);
+    }
+  }
+}
