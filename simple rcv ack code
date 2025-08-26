@@ -1,0 +1,63 @@
+\\TX(WROOM):
+#include <HardwareSerial.h>
+HardwareSerial loraSerial(2);  // UART2 (TX2/RX2)
+
+void setup() {
+  Serial.begin(115200);
+  loraSerial.begin(115200, SERIAL_8N1, 4, 5);  // RX2=16, TX2=17 (adjust if wired differently)
+
+  delay(2000);
+  Serial.println("TX Ready");
+
+  // Set local address = 9
+  loraSerial.println("AT+ADDRESS=7");
+  delay(100);
+  // Set destination address = 12
+  loraSerial.println("AT+DESTINATION=12");
+  delay(100);
+}
+
+void loop() {
+  // Send Hello
+  loraSerial.println("AT+SEND=12,5,Hello");
+  Serial.println("Sent: Hello");
+  delay(2000);
+
+  // Check for response
+  if (loraSerial.available()) {
+    String resp = loraSerial.readStringUntil('\n');
+    Serial.println("Got back: " + resp);
+  }
+}
+
+
+
+-------------------------------------------------------------------------
+//RX(DEV):
+#include <HardwareSerial.h>
+HardwareSerial loraSerial(2);  // UART2 (TX2/RX2)
+
+void setup() {
+  Serial.begin(115200);
+  loraSerial.begin(115200, SERIAL_8N1, 16, 17);  // RX2=16, TX2=17 (adjust pins)
+
+  delay(2000);
+  Serial.println("RX Ready");
+
+  // Set local address = 12
+  loraSerial.println("AT+ADDRESS=12");
+  delay(100);
+}
+
+void loop() {
+  // Check for data
+  if (loraSerial.available()) {
+    String msg = loraSerial.readStringUntil('\n');
+    Serial.println("Received: " + msg);
+
+    // Reply ACK to sender (Addr 9)
+    loraSerial.println("AT+SEND=7,3,ACK");
+    Serial.println("Sent: ACK");
+    delay(2000);
+  }
+}
