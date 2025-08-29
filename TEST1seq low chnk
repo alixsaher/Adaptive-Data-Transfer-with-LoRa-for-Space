@@ -1,0 +1,538 @@
+/* ESP-DEV TX
+   - TCP server receives file from ESP-CAM (unchanged)
+   - Then the file is chunked & sent via Reyax using AT+SEND=<addr>,<len>,<data>
+   - Data packets: ASCII control or hex-encoded binary
+   - Expects ACKs from RX for each chunk: "ACK:<seq>"
+*/
+
+#include <WiFi.h>
+#include "FS.h"
+#include "SPIFFS.h"
+
+const char* ssid = "Galaxy 5G";
+const char* password = "#200shloka";
+const uint16_t listen_port = 12345;
+
+WiFiServer tcpServer(listen_port);
+
+// --- Reyax config ---
+HardwareSerial &reyax = Serial2;
+const unsigned long REYAX_BAUD = 115200;
+const uint16_t REYAX_TX_ADDR = 7;   // this device's Reyax address (TX side)
+const uint16_t REYAX_DST_ADDR = 12; // RX Reyax address
+const size_t CHUNK_RAW = 10;       // raw bytes per chunk (hex -> 200 chars)
+const unsigned long ACK_TIMEOUT_MS = 8000UL; // wait for ACK per chunk
+
+// helper buffers
+String lineBuf;
+
+void flushReyaxInput() {
+  while (reyax.available()) reyax.read();
+}
+
+bool sendATCommand(const String &cmd, unsigned long timeout=1000) {
+  // send command and wait for "OK"
+  while (reyax.available()) reyax.read();
+  reyax.print(cmd);
+  reyax.print("\r\n");
+  unsigned long t0 = millis();
+  String resp = "";
+  while (millis() - t0 < timeout) {
+    while (reyax.available()) {
+      char c = (char)reyax.read();
+      resp += c;
+      if (resp.endsWith("\r\nOK\r\n")) {
+        Serial.printf("REYAX OK for: %s\n", cmd.c_str());
+        return true;
+      }
+      if (resp.indexOf("ERROR") >= 0) {
+        Serial.printf("REYAX ERROR for: %s -> %s\n", cmd.c_str(), resp.c_str());
+        return false;
+      }
+    }
+  }
+  Serial.printf("REYAX no-response for: %s (resp: %s)\n", cmd.c_str(), resp.c_str());
+  return false;
+}
+
+String toHex(const uint8_t *data, size_t len) {
+  // convert raw bytes to ASCII hex (uppercase)
+  static const char hexchars[] = "0123456789ABCDEF";
+  String s;
+  s.reserve(len * 2 + 4);
+  for (size_t i = 0; i < len; ++i) {
+    uint8_t b = data[i];
+    s += hexchars[b >> 4];
+    s += hexchars[b & 0x0F];
+  }
+  return s;
+}
+
+bool waitForACK(uint16_t seq, unsigned long timeoutMs) {
+  // Expect ACK from remote in format: +RCV=<addr>,<len>,ACK:<seq>,<rssi>,<snr>
+  unsigned long t0 = millis();
+  String incoming;
+  while (millis() - t0 < timeoutMs) {
+    while (reyax.available()) {
+      char c = (char)reyax.read();
+      incoming += c;
+      // full line?
+      if (incoming.endsWith("\r\n")) {
+        // parse
+        if (incoming.indexOf("ACK:") >= 0) {
+          // find seq after ACK:
+          int p = incoming.indexOf("ACK:");
+          String seqStr = incoming.substring(p + 4);
+          // trim
+          seqStr.trim();
+          long rseq = seqStr.toInt();
+          Serial.printf("Received ACK for seq %ld (raw line: %s)\n", rseq, incoming.c_str());
+          incoming = "";
+          if (rseq == seq) return true;
+        } else {
+          // not ACK - show it
+          Serial.print("REYAX RX LINE: ");
+          Serial.print(incoming);
+          incoming = "";
+        }
+      }
+    }
+    delay(10);
+  }
+  Serial.printf("ACK timeout for seq %u\n", seq);
+  return false;
+}
+
+void setupReyax() {
+  reyax.begin(REYAX_BAUD, SERIAL_8N1, 4, 5); // RX2=16 RX pin, TX2=17 TX pin (adjust if needed)
+  delay(100);
+  Serial.println("Setting Reyax address (TX side)...");
+  // set address
+  sendATCommand(String("AT+ADDRESS=") + REYAX_TX_ADDR, 1500);
+  // ensure returns are flushed
+  flushReyaxInput();
+  Serial.println("Reyax init done.");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\nESP-DEV TX starting...");
+
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+  Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+    while (1) delay(1000);
+  }
+
+  setupReyax();
+
+  tcpServer.begin();
+  Serial.printf("TCP server started on port %d\n", listen_port);
+}
+
+void sendLoRaPacketASCII(const String &payload) {
+  // payload is ASCII text (control packet or hex string) — length is number of chars
+  // build AT command and send
+  String cmd = "AT+SEND=" + String(REYAX_DST_ADDR) + "," + String(payload.length()) + "," + payload;
+  Serial.printf(">> Sending LoRa AT: %s\n", cmd.c_str());
+  reyax.print(cmd);
+  reyax.print("\r\n");
+  // wait a little for module OK
+  unsigned long t0 = millis();
+  String resp = "";
+  while (millis() - t0 < 2000) {
+    while (reyax.available()) {
+      char c = (char)reyax.read();
+      resp += c;
+      // show module response live
+      Serial.write(c);
+    }
+    if (resp.indexOf("OK") >= 0) break;
+  }
+}
+
+void sendFileOverLoRa(const char *path) {
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("SendFile: failed to open file");
+    return;
+  }
+  size_t total = f.size();
+  Serial.printf("Beginning LoRa send. File size: %u bytes\n", (unsigned)total);
+
+  // 1) send header META
+  String meta = "HDR:" + String(total);
+  sendLoRaPacketASCII(meta);
+  Serial.printf("Sent HDR (%s)\n", meta.c_str());
+  delay(500);
+
+  // 2) chunk loop
+  uint8_t buf[CHUNK_RAW];
+  uint16_t seq = 0;
+  size_t sentBytes = 0;
+  while (sentBytes < total) {
+    size_t toRead = min((size_t)CHUNK_RAW, total - sentBytes);
+    size_t r = f.read(buf, toRead);
+    if (r == 0) break;
+    String hexstr = toHex(buf, r);
+    // packet format: H:SEQ:HEX... (SEQ padded to 4 digits)
+    char seqStr[8];
+    sprintf(seqStr, "%04u", seq);
+    String packet = String("H:") + seqStr + ":" + hexstr;
+    // ensure length is not too big
+    if (packet.length() > 230) {
+      Serial.printf("ERROR: packet too large (%u). reduce CHUNK_RAW\n", (unsigned)packet.length());
+      return;
+    }
+    sendLoRaPacketASCII(packet);
+    Serial.printf("Sent chunk seq=%u size=%u raw=%u hex=%u\n", seq, (unsigned)packet.length(), (unsigned)r, (unsigned)hexstr.length());
+    // wait for ACK
+    if (!waitForACK(seq, ACK_TIMEOUT_MS)) {
+      Serial.printf("No ACK for seq %u — retrying once.\n", seq);
+      delay(200);
+      sendLoRaPacketASCII(packet); // simple single retry
+      if (!waitForACK(seq, ACK_TIMEOUT_MS)) {
+        Serial.printf("Chunk %u failed after retry — aborting transfer.\n", seq);
+        f.close();
+        return;
+      }
+    }
+    sentBytes += r;
+    seq++;
+    delay(30); // small gap
+  } // end while
+
+  // 3) send END
+  sendLoRaPacketASCII("END");
+  Serial.println("Sent END packet.");
+  f.close();
+}
+
+void loop() {
+  // Handle TCP reception
+  WiFiClient client = tcpServer.available();
+  if (client) {
+    Serial.println("Client connected, receiving file...");
+    File file = SPIFFS.open("/to_send.jpg", FILE_WRITE);
+    if (!file) {
+      Serial.println("Failed to open file for writing");
+      client.stop();
+      return;
+    }
+
+    uint8_t buffer[1024];
+    size_t totalBytes = 0, chunkCount = 0;
+    unsigned long lastRecv = millis();
+    while (client.connected()) {
+      while (client.available()) {
+        size_t bytesRead = client.read(buffer, sizeof(buffer));
+        if (bytesRead > 0) {
+          file.write(buffer, bytesRead);
+          totalBytes += bytesRead;
+          chunkCount++;
+          lastRecv = millis();
+        }
+      }
+      // if client silent for 2s we assume end
+      if (millis() - lastRecv > 2000) break;
+      delay(10);
+    }
+    file.close();
+    client.stop();
+    Serial.printf("TCP file received: %u bytes, chunks: %u\n", (unsigned)totalBytes, (unsigned)chunkCount);
+
+    // Start LoRa send
+    sendFileOverLoRa("/to_send.jpg");
+  }
+
+  // Also print any spontaneous Reyax lines so you can see incoming ACKs
+  while (reyax.available()) {
+    char c = (char)reyax.read();
+    Serial.write(c);
+  }
+
+  delay(10);
+}
+
+
+
+/* RX code - corrected and debugged
+   - Talks to Reyax on Serial2
+   - Parses +RCV=... lines from Reyax
+   - Protocol:
+     * HDR:<filesize>         -> start, create file and remember expected size
+     * H:SSSS:HEXDATA         -> data chunk (SSSS = 4-digit seq), HEXDATA = hex of raw bytes
+     * END                    -> finish, close file and make it available at /received.jpg
+   - After every H: packet the RX sends back an ACK packet via Reyax:
+     AT+SEND=<tx_addr>,<len>,ACK:<seq>
+*/
+
+#include <WiFi.h>
+#include "FS.h"
+#include "SPIFFS.h"
+#include <WebServer.h>
+
+const char* ssid = "Galaxy 5G";
+const char* password = "#200shloka";
+
+WebServer webServer(80);
+
+// Reyax UART (Serial2)
+HardwareSerial &reyax = Serial2;
+const unsigned long REYAX_BAUD = 115200;
+const uint8_t REYAX_ADDR = 12;    // this RX module's Reyax address
+const uint8_t REYAX_TX_ADDR = 7;  // remote (TX) Reyax address to reply ACKs
+const int REYAX_RX_PIN = 16;      // ESP32 pin connected to Reyax TX
+const int REYAX_TX_PIN = 17;      // ESP32 pin connected to Reyax RX
+
+// reassembly
+File outFile;
+bool receiving = false;
+uint32_t expectedSize = 0;
+uint32_t receivedBytes = 0;
+String partialLine = "";
+
+// -------------------- Helpers --------------------
+void setupReyax() {
+  reyax.begin(REYAX_BAUD, SERIAL_8N1, REYAX_RX_PIN, REYAX_TX_PIN);
+  delay(150);
+  Serial.println("Setting Reyax address (RX side)...");
+  reyax.print(String("AT+ADDRESS=") + REYAX_ADDR + "\r\n");
+  delay(300);
+  // flush responses
+  unsigned long t0 = millis();
+  while (millis() - t0 < 500) {
+    while (reyax.available()) {
+      String s = reyax.readStringUntil('\n');
+      s.trim();
+      if (s.length()) Serial.print("REYAX INIT: "), Serial.println(s);
+    }
+  }
+}
+
+// Convert hex string to bytes. 'buffer' must have enough space (hex.length()/2).
+void hexToBytes(const String &hex, uint8_t *buffer, size_t &length) {
+  length = 0;
+  size_t L = hex.length();
+  // ensure even length
+  if (L % 2 != 0) {
+    Serial.println("hexToBytes: odd length!");
+    return;
+  }
+  for (size_t i = 0; i < L; i += 2) {
+    char a = hex.charAt(i);
+    char b = hex.charAt(i + 1);
+    String hexStr = String(a) + String(b);
+    long val = strtol(hexStr.c_str(), nullptr, 16);
+    buffer[length++] = (uint8_t) (val & 0xFF);
+  }
+}
+
+void sendLoRaASCII(const String &payload) {
+  // Build AT command and send via Reyax; payload must be ASCII
+  String cmd = "AT+SEND=" + String(REYAX_TX_ADDR) + "," + String(payload.length()) + "," + payload;
+  Serial.printf(">> REYAX SEND: %s\n", cmd.c_str());
+  reyax.print(cmd + "\r\n");
+  // read any immediate replies for debugging
+  unsigned long t0 = millis();
+  while (millis() - t0 < 400) {
+    while (reyax.available()) {
+      char c = (char)reyax.read();
+      Serial.write(c);
+    }
+  }
+}
+
+// Robustly parse Reyax +RCV= lines and handle protocol
+void handleReyaxLine(const String &lineIn) {
+  String line = lineIn;
+  line.trim();
+  if (line.length() == 0) return;
+  Serial.printf("REYAX LINE: %s\n", line.c_str());
+
+  // Expect format: +RCV=<srcAddr>,<len>,<data>,<rssi>,<snr>
+  int eqPos = line.indexOf('=');
+  if (eqPos < 0) {
+    Serial.println("No '=' in line");
+    return;
+  }
+  // find commas
+  int c1 = line.indexOf(',', eqPos + 1);
+  if (c1 < 0) { Serial.println("Malformed +RCV (c1)"); return; }
+  int c2 = line.indexOf(',', c1 + 1);
+  if (c2 < 0) { Serial.println("Malformed +RCV (c2)"); return; }
+  int c3 = line.indexOf(',', c2 + 1);
+  if (c3 < 0) { Serial.println("Malformed +RCV (c3)"); return; }
+
+  String srcAddrStr = line.substring(eqPos + 1, c1);
+  String lenStr = line.substring(c1 + 1, c2);
+  String payload = line.substring(c2 + 1, c3);
+
+  srcAddrStr.trim(); lenStr.trim(); payload.trim();
+  Serial.printf("Parsed +RCV src=%s len=%s payload=%s\n", srcAddrStr.c_str(), lenStr.c_str(), payload.c_str());
+
+  // Protocol handling
+  if (payload.startsWith("HDR:")) {
+    String num = payload.substring(4);
+    num.trim();
+    expectedSize = (uint32_t) num.toInt();
+    Serial.printf("HDR received. Expecting %u bytes. Creating file...\n", expectedSize);
+    if (outFile) outFile.close();
+    if (SPIFFS.exists("/received.jpg")) SPIFFS.remove("/received.jpg");
+    outFile = SPIFFS.open("/received.jpg", FILE_WRITE);
+    if (!outFile) {
+      Serial.println("Failed to open /received.jpg for writing!");
+      receiving = false;
+      return;
+    }
+    receiving = true;
+    receivedBytes = 0;
+  }
+  else if (payload == "END") {
+    Serial.println("END received. Closing file.");
+    if (outFile) {
+      outFile.close();
+      Serial.printf("Total written: %u bytes. File saved to /received.jpg\n", receivedBytes);
+    } else {
+      Serial.println("No open file to close.");
+    }
+    receiving = false;
+  }
+  else if (payload.startsWith("H:")) {
+    // Expect: H:SSSS:HEX...
+    int secondColon = payload.indexOf(':', 2);
+    if (secondColon < 0) { Serial.println("Malformed H: (no second colon)"); return; }
+    String seqStr = payload.substring(2, secondColon);
+    String hexdata = payload.substring(secondColon + 1);
+    seqStr.trim(); hexdata.trim();
+    uint16_t seq = (uint16_t) seqStr.toInt();
+
+    if (hexdata.length() == 0) {
+      Serial.printf("Seq %u: empty hexdata\n", seq);
+    } else {
+      size_t maxOut = hexdata.length() / 2;
+      // allocate buffer
+      uint8_t *buf = (uint8_t*) malloc(maxOut);
+      if (!buf) {
+        Serial.println("malloc failed -> cannot decode chunk");
+      } else {
+        size_t outLen = 0;
+        hexToBytes(hexdata, buf, outLen);
+        if (outLen > 0) {
+          if (receiving && outFile) {
+            size_t written = outFile.write(buf, outLen);
+            receivedBytes += written;
+            Serial.printf("Wrote seq %u bytes=%u (written=%u) total=%u\n", seq, (unsigned)outLen, (unsigned)written, (unsigned)receivedBytes);
+          } else {
+            Serial.println("Not in receiving mode! Ignoring data chunk.");
+          }
+        } else {
+          Serial.println("hexToBytes returned 0 bytes");
+        }
+        free(buf);
+      }
+    }
+    // Send ACK back to sender: format "ACK:<seq>"
+    String ack = String("ACK:") + String(seq);
+    sendLoRaASCII(ack);
+    Serial.printf("ACK sent for seq %u\n", seq);
+  }
+  else {
+    Serial.printf("Unknown payload: %s\n", payload.c_str());
+  }
+}
+
+// -------------------- Web handlers --------------------
+void serveImage() {
+  File file = SPIFFS.open("/received.jpg", FILE_READ);
+  if (!file) {
+    webServer.send(404, "text/plain", "No image found");
+    return;
+  }
+  webServer.streamFile(file, "image/jpeg");
+  file.close();
+}
+
+void serveHTML() {
+  String html = "<html><body style='text-align:center; font-family: Arial, Helvetica, sans-serif;'>";
+  html += "<h1>Last Received Image</h1>";
+  html += "<img src='/image' style='max-width:90%;height:auto;'/>";
+  html += "<p>File: /received.jpg</p>";
+  html += "</body></html>";
+  webServer.send(200, "text/html", html);
+}
+
+// -------------------- Setup & Loop --------------------
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("\nRX starting...");
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long wifiStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiStart < 20000) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("\nWiFi connect failed or timed out.");
+  } else {
+    Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+  }
+
+  // SPIFFS
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
+    while (1) delay(1000);
+  }
+
+  // Reyax init
+  setupReyax();
+
+  // Webserver
+  webServer.on("/", serveHTML);
+  webServer.on("/image", serveImage);
+  webServer.begin();
+  Serial.println("Web server started.");
+}
+
+void loop() {
+  // handle web clients
+  webServer.handleClient();
+
+  // Read Reyax UART into a line buffer (handles line endings)
+  while (reyax.available()) {
+    char c = (char) reyax.read();
+    // echo raw bytes for debug
+    Serial.write(c);
+    if (c == '\n') {
+      String line = partialLine;
+      line.trim();
+      if (line.length() > 0) {
+        handleReyaxLine(line);
+      }
+      partialLine = "";
+    } else if (c != '\r') {
+      partialLine += c;
+      // prevent runaway memory usage
+      if (partialLine.length() > 800) {
+        Serial.println("Partial line too long -> clearing buffer");
+        partialLine = "";
+      }
+    }
+  }
+
+  // small delay to yield
+  delay(5);
+}
+
