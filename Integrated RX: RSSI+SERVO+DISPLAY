@@ -1,0 +1,133 @@
+//RX dev module with lora rx address=12 
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+
+// === LoRa Serial ===
+HardwareSerial LoRaSerial(1);
+
+// === Servo ===
+Servo antennaServo;
+#define SERVO_PIN 13       // Servo control pin
+
+// === LoRa UART Pins ===
+#define LORA_RX 16   // ESP32 RX (to LoRa TX)
+#define LORA_TX 17   // ESP32 TX (to LoRa RX)
+
+// === TFT Display Pins ===
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+#define TFT_MOSI 23
+#define TFT_SCK  18
+// connect LED pin of TFT to 3.3V/5V
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// === Servo Scan Settings ===
+const int stepAngle = 15;        // Degrees per step
+const int scanDelay = 2000;      // Wait per angle to receive LoRa
+int bestRSSI = -999;
+int bestAngle = 0;
+
+// === Helper: Draw a cute header ===
+void drawHeader(const char *title) {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextSize(3);
+  tft.setTextColor(ILI9341_MAGENTA);
+  tft.setCursor(10, 10);
+  tft.println(title);
+
+  tft.drawLine(0, 45, 240, 45, ILI9341_WHITE);
+}
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  antennaServo.attach(SERVO_PIN);
+
+  // === TFT Init ===
+  tft.begin();
+  drawHeader("RSSI Scan");
+  tft.setCursor(10, 60);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(2);
+  tft.println("Booting LoRa...");
+  delay(2000);
+  tft.fillRect(0, 60, 240, 180, ILI9341_BLACK);
+}
+
+// === Main Loop ===
+void loop() {
+  bestRSSI = -999;
+  bestAngle = 0;
+
+  for (int angle = 0; angle <= 180; angle += stepAngle) {
+    antennaServo.write(angle);
+    Serial.println("🔄 Scanning Angle: " + String(angle) + "°");
+    delay(scanDelay);
+
+    int currentRSSI = -999; 
+    String msg = "";
+
+    unsigned long timeout = millis() + 2500;
+    while (millis() < timeout) {
+      if (LoRaSerial.available()) {
+        msg = LoRaSerial.readStringUntil('\n');
+        msg.trim();
+        Serial.println("📩 " + msg);
+
+        // === Parse +RCV ===
+        if (msg.startsWith("+RCV")) {
+          int commas[5], count = 0;
+          for (int i = 0; i < msg.length(); i++) {
+            if (msg.charAt(i) == ',' && count < 4) commas[count++] = i;
+          }
+
+          if (count >= 4) {
+            String rssiStr = msg.substring(commas[2] + 1, commas[3]);
+            currentRSSI = rssiStr.toInt();
+            Serial.println("📶 RSSI: " + String(currentRSSI));
+
+            if (currentRSSI > bestRSSI) {
+              bestRSSI = currentRSSI;
+              bestAngle = angle;
+              Serial.println("✨ New Best → " + String(bestRSSI) + " dBm at " + String(bestAngle) + "°");
+            }
+          }
+          break;
+        }
+      }
+    }
+
+    // === Update TFT with angle info ===
+    tft.fillRect(0, 60, 240, 90, ILI9341_BLACK);
+    tft.setCursor(10, 70);
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.setTextSize(2);
+    tft.println("Angle: " + String(angle) + "°");
+
+    tft.setCursor(10, 100);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.println("RSSI: " + String(currentRSSI));
+  }
+
+  // === Final Result ===
+  Serial.println("🏁 Best Angle: " + String(bestAngle) + "° | Best RSSI: " + String(bestRSSI));
+  antennaServo.write(bestAngle);
+
+  tft.fillRect(0, 160, 240, 70, ILI9341_BLACK);
+  tft.setCursor(10, 170);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(2);
+  tft.println("Best Angle: " + String(bestAngle) + "°");
+
+  tft.setCursor(10, 200);
+  tft.setTextColor(ILI9341_MAGENTA);
+  tft.println("Best RSSI: " + String(bestRSSI));
+
+  delay(8000); // Wait before rescanning
+}
