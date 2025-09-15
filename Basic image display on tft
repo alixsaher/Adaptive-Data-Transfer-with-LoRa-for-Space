@@ -1,4 +1,5 @@
-//make sure your image is saved as JPG from paint
+//make sure your image is saved as JPG from paint 
+//IMPPPP only connect MISO of sd to 19 DO NOT CONNECT MISO OF TFT!!
 #include <SPI.h>
 #include <SD.h>
 #include <Adafruit_GFX.h>
