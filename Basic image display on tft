@@ -1,0 +1,90 @@
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <JPEGDecoder.h>
+
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+#define SD_CS    14
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+void setup() {
+  Serial.begin(115200);
+
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD card failed!");
+    tft.setCursor(10, 10);
+    tft.setTextColor(ILI9341_RED);
+    tft.setTextSize(2);
+    tft.println("SD card failed!");
+    return;
+  }
+  Serial.println("SD card initialized.");
+
+  drawSdJpeg("/IM.JPG");
+}
+
+void loop() {
+  // Nothing here
+}
+
+void drawSdJpeg(const char *filename) {
+  File jpegFile = SD.open(filename, FILE_READ);
+  if (!jpegFile) {
+    Serial.print("File not found: "); Serial.println(filename);
+    return;
+  }
+
+  if (JpegDec.decodeSdFile(jpegFile)) {
+    jpegRenderZoom();
+  } else {
+    Serial.println("JPEG decode failed!");
+  }
+
+  jpegFile.close();
+}
+
+// Zoom image to fill full TFT screen
+void jpegRenderZoom() {
+  uint16_t imgW = JpegDec.width;
+  uint16_t imgH = JpegDec.height;
+
+  float scaleX = (float)tft.width()  / imgW;
+  float scaleY = (float)tft.height() / imgH;
+
+  uint32_t drawTime = millis();
+
+  while (JpegDec.read()) {
+    uint16_t *pImg = JpegDec.pImage;
+    uint16_t mcuW = JpegDec.MCUWidth;
+    uint16_t mcuH = JpegDec.MCUHeight;
+
+    for (int y = 0; y < mcuH; y++) {
+      for (int x = 0; x < mcuW; x++) {
+        int imgX = JpegDec.MCUx * mcuW + x;
+        int imgY = JpegDec.MCUy * mcuH + y;
+
+        if (imgX >= imgW || imgY >= imgH) continue;
+
+        uint16_t color = pImg[y * mcuW + x];
+
+        // Zoom to full screen
+        int screenX = imgX * scaleX;
+        int screenY = imgY * scaleY;
+
+        tft.fillRect(screenX, screenY, scaleX + 1, scaleY + 1, color); // +1 to avoid gaps
+      }
+    }
+  }
+
+  Serial.print("JPEG drawn zoomed in ");
+  Serial.print(millis() - drawTime);
+  Serial.println(" ms");
+}
