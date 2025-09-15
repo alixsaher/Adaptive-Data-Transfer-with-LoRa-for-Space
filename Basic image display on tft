@@ -1,3 +1,4 @@
+//make sure your image is saved as JPG from paint
 #include <SPI.h>
 #include <SD.h>
 #include <Adafruit_GFX.h>
