@@ -1,0 +1,49 @@
+// === IMPORTANT ===
+// Only connect SD MISO to GPIO19
+// Do NOT connect TFT MISO!
+// TFT uses MOSI + SCK + CS, DC, RST only.
+
+#include <SPI.h>
+#include <SD.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+#define SD_CS    14
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\nStarting TFT + SD test...");
+
+  // Init TFT
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+
+  // Init SD
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD card failed!");
+    tft.setCursor(10, 10);
+    tft.setTextColor(ILI9341_RED);
+    tft.setTextSize(2);
+    tft.println("SD FAIL!");
+    return;
+  }
+  Serial.println("SD card initialized.");
+
+  // Display success message on TFT
+  tft.setCursor(20, 50);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(3);
+  tft.println("TFT + SD OK");
+
+  Serial.println("TFT + SD OK");
+}
+
+void loop() {
+  // Nothing here
+}
