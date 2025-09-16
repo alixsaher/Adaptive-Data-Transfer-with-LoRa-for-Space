@@ -1,0 +1,540 @@
+//RX
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <SD.h>
+
+// === LoRa Serial ===
+HardwareSerial LoRaSerial(1);
+
+// === Servo ===
+Servo antennaServo;
+#define SERVO_PIN 13
+
+// === LoRa UART Pins ===
+#define LORA_RX 16
+#define LORA_TX 17
+
+// === TFT Display Pins ===
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+#define SD_CS    14
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// === Reyax config ===
+const uint16_t REYAX_TX_ADDR = 12; // RX address
+const uint16_t REYAX_DST_ADDR = 7; // TX address
+
+// === Servo Scan Settings ===
+const int stepAngle = 15;
+const int scanDelay = 2000;
+int bestRSSI = -999;
+int bestAngle = 0;
+
+int packetCount = 0;
+const int maxPackets = 12;  // between 10 and 15
+
+// === LoRa Functions ===
+void sendLoRaPacket(const String& payload) {
+  String cmd = "AT+SEND=" + String(REYAX_DST_ADDR) + "," + String(payload.length()) + "," + payload;
+  LoRaSerial.print(cmd);
+  LoRaSerial.print("\r\n");
+  Serial.println("Sent: " + payload);
+}
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  antennaServo.attach(SERVO_PIN);
+
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+
+  if (!SD.begin(SD_CS)) {
+    tft.setCursor(10, 10);
+    tft.setTextColor(ILI9341_RED);
+    tft.setTextSize(2);
+    tft.println("SD FAIL!");
+  } else {
+    tft.setCursor(20, 50);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextSize(2);
+    tft.println("Initializing System...");
+  }
+  delay(1000);
+}
+
+// === RSSI Scan ===
+void scanRSSI() {
+  bestRSSI = -999;
+  bestAngle = 0;
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(10, 10);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextSize(2);
+  tft.println("Finding RSSI...");
+
+  for (int angle = 0; angle <= 180; angle += stepAngle) {
+    antennaServo.write(angle);
+    delay(scanDelay);
+
+    int currentRSSI = -999;
+    String msg = "";
+    unsigned long timeout = millis() + 2000;
+
+    while (millis() < timeout) {
+      if (LoRaSerial.available()) {
+        msg = LoRaSerial.readStringUntil('\n');
+        msg.trim();
+        if (msg.startsWith("+RCV")) {
+          int commas[4], count = 0;
+          for (int i = 0; i < msg.length(); i++) {
+            if (msg.charAt(i) == ',' && count < 4) commas[count++] = i;
+          }
+          if (count >= 3) {
+            String rssiStr = msg.substring(commas[2] + 1, commas[3]);
+            currentRSSI = rssiStr.toInt();
+            // Check if payload is "Hi"
+            String payload = msg.substring(commas[3] + 1);
+            if (payload.indexOf("Hi") != -1) {
+              if (currentRSSI > bestRSSI) {
+                bestRSSI = currentRSSI;
+                bestAngle = angle;
+              }
+            }
+          }
+          break;
+        }
+      }
+    }
+    // Update TFT with current scan status
+    tft.fillRect(0, 40, 240, 90, ILI9341_BLACK);
+    tft.setCursor(10, 40);
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.setTextSize(2);
+    tft.println("Angle: " + String(angle) + "°");
+
+    tft.setCursor(10, 70);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.println("RSSI: " + String(currentRSSI));
+  }
+
+  antennaServo.write(bestAngle);
+
+  tft.fillRect(0, 160, 240, 70, ILI9341_BLACK);
+  tft.setCursor(10, 180);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.println("Best Angle: " + String(bestAngle) + "°");
+
+  tft.setCursor(10, 210);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.println("Best RSSI: " + String(bestRSSI));
+
+  // Acknowledge that the scan is complete
+  sendLoRaPacket("SCAN_COMPLETE");
+  Serial.println("Sent acknowledgment: SCAN_COMPLETE");
+
+  delay(2000);
+}
+
+// === Helper to parse and display payload ===
+void displaySensorPayload(String payload) {
+  String fields[11];
+  int fieldIndex = 0;
+  int lastComma = -1;
+
+  for (int i = 0; i < payload.length() && fieldIndex < 11; i++) {
+    if (payload.charAt(i) == ',') {
+      fields[fieldIndex] = payload.substring(lastComma + 1, i);
+      lastComma = i;
+      fieldIndex++;
+    }
+  }
+  if (fieldIndex < 11) {
+    fields[fieldIndex] = payload.substring(lastComma + 1);
+  }
+
+  tft.fillRect(0, 80, 240, 140, ILI9341_BLACK);
+  tft.setCursor(10, 90);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setTextSize(2);
+  tft.println("Pkt " + String(packetCount));
+
+  tft.setCursor(10, 120);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(1);
+  tft.println("Accel: X=" + fields[0] + " Y=" + fields[1] + " Z=" + fields[2]);
+
+  tft.setCursor(10, 140);
+  tft.println("Gyro:  X=" + fields[3] + " Y=" + fields[4] + " Z=" + fields[5]);
+
+  tft.setCursor(10, 160);
+  tft.println("BMP:   T=" + fields[6] + " P=" + fields[7] + " A=" + fields[8]);
+
+  tft.setCursor(10, 180);
+  tft.println("DHT:   T=" + fields[9] + " H=" + fields[10]);
+}
+
+// === Loop ==
+void loop() {
+  if (packetCount == 0) {
+    scanRSSI();
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(20, 40);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextSize(2);
+    tft.println("Entering Data Rx Mode...");
+  }
+
+  if (LoRaSerial.available()) {
+    String msg = LoRaSerial.readStringUntil('\n');
+    msg.trim();
+
+    // Debug: show raw message first
+    Serial.println("RAW MSG: " + msg);
+
+    if (msg.startsWith("+RCV")) {
+      int firstComma = msg.indexOf(',');
+      int secondComma = msg.indexOf(',', firstComma + 1);
+
+      if (firstComma > 0 && secondComma > 0) {
+        // --- CORRECT: take full payload after second comma ---
+        String payload = msg.substring(secondComma + 1);
+
+        packetCount++;
+        displaySensorPayload(payload); // this function already splits the 11 fields correctly
+        delay(2000);  // Keep display for 2 seconds
+      }
+    }
+  }
+}
+
+
+
+//TX
+
+#include <HardwareSerial.h>
+#include <WiFi.h>
+#include "FS.h"
+#include "SPIFFS.h"
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <DHT.h>
+#include <WebServer.h>
+
+// --- WiFi & TCP Server Config ---
+const char* ssid = "Airtel";
+const char* password = "saherali";
+const uint16_t listen_port = 12345;
+WiFiServer tcpServer(listen_port);
+
+// === GY-91 ===
+#define MPU_ADDR 0x68
+#define BMP_ADDR 0x76
+Adafruit_BMP280 bmp;
+
+// === DHT11 ===
+#define DHT_PIN 14
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// === LoRa UART ===
+#define LORA_RX 4
+#define LORA_TX 5
+HardwareSerial LoRaSerial(1); // UART1 (TX2/RX2)
+
+// --- Reyax config ---
+const unsigned long REYAX_BAUD = 115200;
+const uint16_t REYAX_TX_ADDR = 7;
+const uint16_t REYAX_DST_ADDR = 12;
+const size_t CHUNK_RAW = 10;
+const unsigned long ACK_TIMEOUT_MS = 8000UL;
+const uint8_t MAX_RETRIES = 5;
+
+// --- Timing and State Management ---
+unsigned long lastSend = 0;
+const unsigned long hiInterval = 200; // send "Hi" every 200ms
+const unsigned long sensorInterval = 1000; // sensor packets every 1s
+bool sendingHi = true;
+bool sendingSensorData = false;
+bool awaitingImage = false;
+int sensorPacketsSent = 0;
+const int maxSensorPackets = 25;
+
+// --- Sensor Read Function ---
+String readSensorString() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 14, true);
+
+  int16_t AcX = Wire.read() << 8 | Wire.read();
+  int16_t AcY = Wire.read() << 8 | Wire.read();
+  int16_t AcZ = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read();
+  int16_t GyX = Wire.read() << 8 | Wire.read();
+  int16_t GyY = Wire.read() << 8 | Wire.read();
+  int16_t GyZ = Wire.read() << 8 | Wire.read();
+
+  float Ax = AcX / 16384.0;
+  float Ay = AcY / 16384.0;
+  float Az = AcZ / 16384.0;
+  float Gx = GyX / 131.0;
+  float Gy = GyY / 131.0;
+  float Gz = GyZ / 131.0;
+
+  float temperature = bmp.readTemperature();
+  float pressure = bmp.readPressure() / 100.0F;
+  float altitude = bmp.readAltitude(1013.25);
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  String output = String(Ax, 2) + "," + String(Ay, 2) + "," + String(Az, 2) + ",";
+  output += String(Gx, 2) + "," + String(Gy, 2) + "," + String(Gz, 2) + ",";
+  output += String(temperature, 1) + "," + String(pressure, 1) + "," + String(altitude, 1) + ",";
+  output += String(t, 1) + "," + String(h, 1);
+
+  return output;
+}
+
+// --- LoRa Communication Functions ---
+
+// This function sends a command and waits for an OK response
+bool sendATCommand(const String &cmd, unsigned long timeout = 1000) {
+  while (LoRaSerial.available()) LoRaSerial.read();
+  LoRaSerial.print(cmd); LoRaSerial.print("\r\n");
+  unsigned long t0 = millis();
+  String resp = "";
+  while (millis() - t0 < timeout) {
+    while (LoRaSerial.available()) {
+      char c = (char)LoRaSerial.read();
+      resp += c;
+      if (resp.endsWith("\r\nOK\r\n")) return true;
+      if (resp.indexOf("ERROR") >= 0) return false;
+    }
+  }
+  return false;
+}
+
+// This is the new, simple send function without ACK waiting
+void sendLoRaPacket(const String &payload) {
+  String cmd = "AT+SEND=" + String(REYAX_DST_ADDR) + "," + String(payload.length()) + "," + payload;
+  LoRaSerial.print(cmd); LoRaSerial.print("\r\n");
+  Serial.println("Sent packet (no ACK): " + payload);
+}
+
+// This function is for image transmission and still includes ACK logic
+String toHex(const uint8_t *data, size_t len) {
+  static const char hexchars[] = "0123456789ABCDEF";
+  String s; s.reserve(len * 2 + 4);
+  for (size_t i = 0; i < len; i++) {
+    uint8_t b = data[i];
+    s += hexchars[b >> 4];
+    s += hexchars[b & 0x0F];
+  }
+  return s;
+}
+
+bool waitForACK(uint16_t seq, unsigned long timeoutMs) {
+  unsigned long t0 = millis();
+  String incoming;
+  while (millis() - t0 < timeoutMs) {
+    while (LoRaSerial.available()) {
+      char c = (char)LoRaSerial.read();
+      incoming += c;
+      if (incoming.endsWith("\r\n")) {
+        if (incoming.indexOf("ACK:") >= 0) {
+          int p = incoming.indexOf("ACK:");
+          String seqStr = incoming.substring(p + 4);
+          seqStr.trim();
+          long rseq = seqStr.toInt();
+          incoming = "";
+          if (rseq == seq) return true;
+        } else incoming = "";
+      }
+    }
+    delay(10);
+  }
+  return false;
+}
+
+void setupReyax() {
+  LoRaSerial.begin(REYAX_BAUD, SERIAL_8N1, LORA_RX, LORA_TX);
+  delay(100);
+  sendATCommand(String("AT+ADDRESS=") + REYAX_TX_ADDR, 1500);
+  // No need to flush here as sendATCommand already does it
+}
+
+void sendFileOverLoRa(const char *path) {
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) {
+    Serial.println("Failed to open file");
+    return;
+  }
+  size_t total = f.size();
+  Serial.printf("Sending file size: %u bytes\n", (unsigned) total);
+  sendLoRaPacket("HDR:" + String(total));
+  delay(500);
+
+  uint8_t buf[CHUNK_RAW];
+  uint16_t seq = 0;
+  size_t sentBytes = 0;
+  while (sentBytes < total) {
+    size_t toRead = min((size_t) CHUNK_RAW, total - sentBytes);
+    size_t r = f.read(buf, toRead);
+    if (r == 0) break;
+    String hexstr = toHex(buf, r);
+    char seqStr[8];
+    sprintf(seqStr, "%04u", seq);
+    String packet = "H:" + String(seqStr) + ":" + hexstr;
+    bool acked = false;
+    for (uint8_t attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      String cmd = "AT+SEND=" + String(REYAX_DST_ADDR) + "," + String(packet.length()) + "," + packet;
+      LoRaSerial.print(cmd); LoRaSerial.print("\r\n");
+      Serial.println("Sent image packet: " + packet);
+      if (waitForACK(seq, ACK_TIMEOUT_MS)) {
+        acked = true;
+        break;
+      }
+      Serial.printf("Retry %d for seq %u\n", attempt, seq);
+      delay(200);
+    }
+    if (!acked) {
+      Serial.printf("Chunk %u failed after %d retries. Abort.\n", seq, MAX_RETRIES);
+      f.close();
+      return;
+    }
+    sentBytes += r;
+    seq++;
+    delay(30);
+  }
+  sendLoRaPacket("END");
+  Serial.println("Sent END");
+  f.close();
+}
+
+// --- Setup ---
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  dht.begin();
+
+  // Wake up MPU
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
+  if (!bmp.begin(BMP_ADDR)) {
+    Serial.println("BMP280 not found!");
+    while (1);
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long startAttemptTime = millis();
+  const unsigned long wifiTimeout = 15000;
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < wifiTimeout) {
+    delay(300);
+    Serial.print(".");
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\nWiFi connection failed. Halting.");
+    while (true) delay(1000);
+  }
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed. Halting.");
+    while (true) delay(1000);
+  }
+
+  setupReyax();
+  tcpServer.begin();
+  Serial.println("🚀 LoRa TX & WebServer Started");
+}
+
+// --- Main Loop ---
+void loop() {
+  unsigned long now = millis();
+  
+  // Phase 1: Send "Hi" for RSSI scanning
+  if (sendingHi) {
+    if (now - lastSend >= hiInterval) {
+      lastSend = now;
+      sendLoRaPacket("Hi"); // No ACK for this
+    }
+    // Transition to sensor data after 25 seconds
+    static unsigned long hiStart = millis();
+    if (millis() - hiStart >= 20000) {
+      sendingHi = false;
+      sendingSensorData = true;
+      lastSend = 0;
+      Serial.println("✅ Switching to sensor data transmission...");
+      delay(2000);
+    }
+  } 
+  // Phase 2: Send sensor packets
+  else if (sendingSensorData) {
+    if (sensorPacketsSent < maxSensorPackets) {
+      if (now - lastSend >= sensorInterval) {
+        lastSend = now;
+        String payload = readSensorString();
+        sendLoRaPacket(payload); // No ACK for this
+        sensorPacketsSent++;
+      }
+    } 
+    // Transition to image transmission after all packets are sent
+    else {
+      sendingSensorData = false;
+      awaitingImage = true;
+      Serial.println("✅ Finished sending sensor data. Awaiting image upload...");
+    }
+  } 
+  // Phase 3: Wait for and send image over LoRa
+  else if (awaitingImage) {
+    WiFiClient client = tcpServer.available();
+    if (client) {
+      Serial.println("📸 Receiving image via TCP...");
+      File file = SPIFFS.open("/to_send.jpg", FILE_WRITE);
+      if (!file) {
+        client.stop();
+        return;
+      }
+      uint8_t buffer[1024];
+      size_t totalBytes = 0;
+      unsigned long lastRecv = millis();
+      while (client.connected()) {
+        while (client.available()) {
+          size_t br = client.read(buffer, sizeof(buffer));
+          if (br > 0) {
+            file.write(buffer, br);
+            totalBytes += br;
+            lastRecv = millis();
+          }
+        }
+        if (millis() - lastRecv > 2000) break;
+        delay(10);
+      }
+      file.close();
+      client.stop();
+      Serial.printf("✅ TCP received %u bytes\n", (unsigned) totalBytes);
+      sendFileOverLoRa("/to_send.jpg");
+      awaitingImage = false;
+      Serial.println("Image transmission complete. Looping again...");
+      sendingHi = true; // Reset state for a new cycle
+      sensorPacketsSent = 0;
+    }
+  }
+}
