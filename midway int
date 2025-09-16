@@ -1,0 +1,470 @@
+//TX
+#include <Wire.h>
+
+#include <Adafruit_BMP280.h>
+
+#include <DHT.h>
+
+#include <HardwareSerial.h>
+
+
+
+// === GY-91 ===
+
+#define MPU_ADDR 0x68
+
+#define BMP_ADDR 0x76
+
+Adafruit_BMP280 bmp;
+
+
+
+// === DHT11 ===
+
+#define DHT_PIN 14
+
+#define DHT_TYPE DHT11
+
+DHT dht(DHT_PIN, DHT_TYPE);
+
+
+
+// === LoRa UART ===
+
+#define LORA_RX 4
+
+#define LORA_TX 5
+
+HardwareSerial LoRaSerial(1);  // UART1 (TX2/RX2)
+
+
+
+// --- MPU9250 Read ---
+
+String readGY91String() {
+
+  String output = "";
+
+
+
+  Wire.beginTransmission(MPU_ADDR);
+
+  Wire.write(0x3B); // ACCEL_XOUT_H
+
+  Wire.endTransmission(false);
+
+  Wire.requestFrom(MPU_ADDR, 14, true);
+
+
+
+  int16_t AcX = Wire.read() << 8 | Wire.read();
+
+  int16_t AcY = Wire.read() << 8 | Wire.read();
+
+  int16_t AcZ = Wire.read() << 8 | Wire.read();
+
+  Wire.read(); Wire.read(); // skip temp
+
+  int16_t GyX = Wire.read() << 8 | Wire.read();
+
+  int16_t GyY = Wire.read() << 8 | Wire.read();
+
+  int16_t GyZ = Wire.read() << 8 | Wire.read();
+
+
+
+  float Ax = AcX / 16384.0;
+
+  float Ay = AcY / 16384.0;
+
+  float Az = AcZ / 16384.0;
+
+  float Gx = GyX / 131.0;
+
+  float Gy = GyY / 131.0;
+
+  float Gz = GyZ / 131.0;
+
+
+
+  // BMP280
+
+  float temperature = bmp.readTemperature();
+
+  float pressure = bmp.readPressure() / 100.0F;
+
+  float altitude = bmp.readAltitude(1013.25);
+
+
+
+  output = String(Ax,2) + "," + String(Ay,2) + "," + String(Az,2) + ",";
+
+  output += String(Gx,2) + "," + String(Gy,2) + "," + String(Gz,2) + ",";
+
+  output += String(temperature,1) + "," + String(pressure,1) + "," + String(altitude,1);
+
+
+
+  return output;
+
+}
+
+
+
+// --- Timing
+
+unsigned long lastSend = 0;
+
+const unsigned long hiInterval = 200; // send "Hi" every 200ms
+
+const unsigned long sensorInterval = 1000; // sensor packets every 1s
+
+
+
+// --- State
+
+bool sendingHi = true;
+
+int sensorPacketsSent = 0;
+
+const int maxSensorPackets = 25;  // 10–15
+
+
+
+void setup() {
+
+  Serial.begin(115200);
+
+  Wire.begin(21, 22);
+
+
+
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+
+  Serial.println("🚀 LoRa TX Started");
+
+
+
+  // Wake up MPU
+
+  Wire.beginTransmission(MPU_ADDR);
+
+  Wire.write(0x6B);
+
+  Wire.write(0);
+
+  Wire.endTransmission(true);
+
+
+
+  if (!bmp.begin(BMP_ADDR)) {
+
+    Serial.println("BMP280 not found!");
+
+    while(1);
+
+  }
+
+
+
+  dht.begin();
+
+  Serial.println("TX Ready: GY-91 + DHT11");
+
+}
+
+
+
+void loop() {
+
+  unsigned long now = millis();
+
+
+
+  if (sendingHi) {
+
+    // --- Send continuous "Hi" for RSSI scanning
+
+    if (now - lastSend >= hiInterval) {
+
+      lastSend = now;
+
+      LoRaSerial.println("AT+SEND=12,2,Hi");
+
+      Serial.println("📤 Sent: Hi → 12");
+
+    }
+
+
+
+    // Optional: stop sending "Hi" after some time
+
+    // For example, after 5 seconds
+
+    static unsigned long hiStart = millis();
+
+    if (millis() - hiStart >= 25000) {
+
+      sendingHi = false;
+
+      lastSend = 0;
+
+      Serial.println("✅ Switching to sensor data transmission...");
+
+      delay(2000);
+
+    }
+
+
+
+  } else if (sensorPacketsSent < maxSensorPackets) {
+
+    // --- Send sensor packets
+
+    if (now - lastSend >= sensorInterval) {
+
+      lastSend = now;
+
+      String gy91Data = readGY91String();
+
+      float h = dht.readHumidity();
+
+      float t = dht.readTemperature();
+
+      String payload = gy91Data + "," + String(t,1) + "," + String(h,1);
+
+
+
+      LoRaSerial.print("AT+SEND=12," + String(payload.length()) + "," + payload + "\r\n");
+
+      Serial.println("📤 Sent sensor packet: " + payload);
+
+      sensorPacketsSent++;
+
+    }
+
+  }
+
+  // After maxSensorPackets, TX can stop or reset sendingHi = true to repeat
+
+}
+
+
+
+//RX
+
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <SD.h>
+
+// === LoRa Serial ===
+HardwareSerial LoRaSerial(1);
+
+// === Servo ===
+Servo antennaServo;
+#define SERVO_PIN 13
+
+// === LoRa UART Pins ===
+#define LORA_RX 16
+#define LORA_TX 17
+
+// === TFT Display Pins ===
+#define TFT_CS   5
+#define TFT_DC   2
+#define TFT_RST  4
+#define SD_CS    14
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// === Servo Scan Settings ===
+const int stepAngle = 15;
+const int scanDelay = 2000;
+int bestRSSI = -999;
+int bestAngle = 0;
+
+int packetCount = 0;
+const int maxPackets = 12;  // between 10 and 15
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+  LoRaSerial.begin(115200, SERIAL_8N1, LORA_RX, LORA_TX);
+  antennaServo.attach(SERVO_PIN);
+
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+
+  if (!SD.begin(SD_CS)) {
+    tft.setCursor(10, 10);
+    tft.setTextColor(ILI9341_RED);
+    tft.setTextSize(2);
+    tft.println("SD FAIL!");
+  } else {
+    tft.setCursor(20, 50);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextSize(2);
+    tft.println("Initializing System...");
+  }
+
+  delay(1000);
+}
+
+// === RSSI Scan ===
+void scanRSSI() {
+  bestRSSI = -999;
+  bestAngle = 0;
+  for (int angle = 0; angle <= 180; angle += stepAngle) {
+    antennaServo.write(angle);
+    delay(scanDelay);
+
+    int currentRSSI = -999;
+    String msg = "";
+    unsigned long timeout = millis() + 2000;
+
+    while (millis() < timeout) {
+      if (LoRaSerial.available()) {
+        msg = LoRaSerial.readStringUntil('\n');
+        msg.trim();
+        if (msg.startsWith("+RCV")) {
+          int commas[5], count = 0;
+          for (int i = 0; i < msg.length(); i++) {
+            if (msg.charAt(i) == ',' && count < 4) commas[count++] = i;
+          }
+          if (count >= 4) {
+            String rssiStr = msg.substring(commas[2] + 1, commas[3]);
+            currentRSSI = rssiStr.toInt();
+            if (currentRSSI > bestRSSI) {
+              bestRSSI = currentRSSI;
+              bestAngle = angle;
+            }
+          }
+          break;
+        }
+      }
+    }
+
+    // Update TFT
+    tft.fillScreen(ILI9341_BLACK);
+    tft.fillRect(0, 60, 240, 90, ILI9341_BLACK);
+    tft.setCursor(20, 50);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextSize(2);
+    tft.println("Finding Rssi, RCV->'Hi'");
+    tft.setCursor(10, 70);
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.setTextSize(2);
+    tft.println("Angle: " + String(angle) + "°");
+
+    tft.setCursor(10, 100);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.println("RSSI: " + String(currentRSSI));
+  }
+
+  antennaServo.write(bestAngle);
+
+  tft.fillRect(0, 160, 240, 70, ILI9341_BLACK);
+  tft.setCursor(10, 180);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(2);
+  tft.println("Best Angle: " + String(bestAngle));
+
+  tft.setCursor(10, 210);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.println("Best RSSI: " + String(bestRSSI));
+
+  delay(2000);
+}
+
+// === Helper to parse and display payload ===
+void displaySensorPayload(String payload) {
+  // Split payload into parts
+  const int numFields = 11; // we expect 11 values
+  String fields[numFields];
+
+  int start = 0;
+  for (int i = 0; i < numFields - 1; i++) {
+    int end = payload.indexOf(',', start);
+    if (end == -1) break; // safeguard
+    fields[i] = payload.substring(start, end);
+    start = end + 1;
+  }
+  fields[numFields - 1] = payload.substring(start); // last field
+
+  // Assign fields
+  String Ax = fields[0];
+  String Ay = fields[1];
+  String Az = fields[2];
+  String Gx = fields[3];
+  String Gy = fields[4];
+  String Gz = fields[5];
+  String BMP_Temp = fields[6];
+  String Pressure = fields[7];
+  String Altitude = fields[8];
+  String DHT_T = fields[9];
+  String DHT_H = fields[10];
+
+  // Display neatly on TFT
+  tft.fillRect(0, 80, 240, 140, ILI9341_BLACK);
+  tft.setCursor(10, 90);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setTextSize(2);
+  tft.println("Pkt " + String(packetCount) + ":");
+
+  tft.setCursor(10, 120);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(1);
+  tft.println("Accel: X=" + Ax + " Y=" + Ay + " Z=" + Az);
+
+  tft.setCursor(10, 140);
+  tft.println("Gyro:  X=" + Gx + " Y=" + Gy + " Z=" + Gz);
+
+  tft.setCursor(10, 160);
+  tft.println("BMP:  T=" + BMP_Temp + "° P=" + Pressure + " A=" + Altitude);
+
+  tft.setCursor(10, 180);
+  tft.println("DHT: T=" + DHT_T + "° H=" + DHT_H);
+}
+
+
+// === Loop ===
+void loop() {
+  if (packetCount == 0) {
+    scanRSSI();
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(20, 40);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextSize(2);
+    tft.println("Entering Data Rx Mode...");
+  }
+
+  if (packetCount < maxPackets) {
+  if (LoRaSerial.available()) {
+    String msg = LoRaSerial.readStringUntil('\n');
+    msg.trim();
+    if (msg.startsWith("+RCV")) {
+      int c1 = msg.indexOf(',');
+      int c2 = msg.indexOf(',', c1 + 1);
+      int c3 = msg.indexOf(',', c2 + 1);
+      if (c1 > 0 && c2 > 0 && c3 > 0) {
+        String payload = msg.substring(c3 + 1);  // <--- take full payload
+        packetCount++;
+        displaySensorPayload(payload);
+        delay(1500);  // Show each packet for 1.5s
+      }
+    }
+  }
+} else {
+    tft.fillScreen(ILI9341_PINK);
+    tft.setCursor(40, 100);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setTextSize(3);
+    tft.println("Capturing...");
+    delay(7000);
+    // Jump to image reception 
+  }
+}
+
