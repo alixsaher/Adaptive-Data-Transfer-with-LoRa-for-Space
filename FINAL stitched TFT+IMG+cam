@@ -324,6 +324,9 @@ void loop() {
 
 
 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+
+
 
 
 // RX (DevKit) - receive chunked image via Reyax LoRa and save to SD (then display on TFT)
@@ -638,76 +641,79 @@ void handleReyaxLine(const String &lineIn) {
 }
 
 // === RSSI Scan ===
+// === RSSI Scan (modified to match second code) ===
 void scanRSSI() {
- bestRSSI = -999;
+  bestRSSI = -999;
   bestAngle = 0;
+
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(10, 10);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setTextSize(2);
+  tft.println("Finding RSSI...");
 
   for (int angle = 0; angle <= 180; angle += stepAngle) {
     antennaServo.write(angle);
-    Serial.println("🔄 Scanning Angle: " + String(angle) + "°");
     delay(scanDelay);
 
-    int currentRSSI = -999; 
+    int currentRSSI = -999;
     String msg = "";
+    unsigned long timeout = millis() + 2000;
 
-    unsigned long timeout = millis() + 2500;
     while (millis() < timeout) {
-      if (LoRaSerial.available()) {
-        msg = LoRaSerial.readStringUntil('\n');
+      if (reyax.available()) {
+        msg = reyax.readStringUntil('\n');
         msg.trim();
-        Serial.println("📩 " + msg);
-
-        // === Parse +RCV ===
         if (msg.startsWith("+RCV")) {
-          int commas[5], count = 0;
+          int commas[4], count = 0;
           for (int i = 0; i < msg.length(); i++) {
             if (msg.charAt(i) == ',' && count < 4) commas[count++] = i;
           }
-
-          if (count >= 4) {
+          if (count >= 3) {
             String rssiStr = msg.substring(commas[2] + 1, commas[3]);
             currentRSSI = rssiStr.toInt();
-            Serial.println("📶 RSSI: " + String(currentRSSI));
 
-            if (currentRSSI > bestRSSI) {
-              bestRSSI = currentRSSI;
-              bestAngle = angle;
-              Serial.println("✨ New Best → " + String(bestRSSI) + " dBm at " + String(bestAngle) + "°");
+            // Payload check "Hi"
+            String payload = msg.substring(commas[3] + 1);
+            if (payload.indexOf("Hi") != -1) {
+              if (currentRSSI > bestRSSI) {
+                bestRSSI = currentRSSI;
+                bestAngle = angle;
+              }
             }
           }
-          break;
+          break; // exit while after reading one +RCV line
         }
       }
     }
 
-    // === Update TFT with angle info ===
-    tft.fillRect(0, 60, 240, 90, ILI9341_BLACK);
-    tft.setCursor(10, 70);
-    tft.setTextColor(ILI9341_YELLOW);
+    // Update TFT with current scan status
+    tft.fillRect(0, 40, 240, 90, ILI9341_BLACK);
+    tft.setCursor(10, 40);
+    tft.setTextColor(ILI9341_WHITE);
     tft.setTextSize(2);
     tft.println("Angle: " + String(angle) + "°");
 
-    tft.setCursor(10, 100);
+    tft.setCursor(10, 70);
     tft.setTextColor(ILI9341_CYAN);
     tft.println("RSSI: " + String(currentRSSI));
   }
 
-  // === Final Result ===
-  Serial.println("🏁 Best Angle: " + String(bestAngle) + "° | Best RSSI: " + String(bestRSSI));
   antennaServo.write(bestAngle);
 
   tft.fillRect(0, 160, 240, 70, ILI9341_BLACK);
-  tft.setCursor(10, 170);
-  tft.setTextColor(ILI9341_GREEN);
+  tft.setCursor(10, 180);
+  tft.setTextColor(ILI9341_WHITE);
   tft.setTextSize(2);
   tft.println("Best Angle: " + String(bestAngle) + "°");
 
-  tft.setCursor(10, 200);
-  tft.setTextColor(ILI9341_MAGENTA);
+  tft.setCursor(10, 210);
+  tft.setTextColor(ILI9341_WHITE);
   tft.println("Best RSSI: " + String(bestRSSI));
 
-  delay(8000); // Wait before rescanning
+  delay(2000);
 }
+
 
 // === Helper to parse and display payload ===
 void displaySensorPayload(String payload) {
@@ -820,3 +826,8 @@ void loop() {
   
   delay(5);
 }
+
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+//cam
