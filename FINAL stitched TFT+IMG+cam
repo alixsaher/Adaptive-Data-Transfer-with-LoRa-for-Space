@@ -1,0 +1,822 @@
+//cam code is same as before
+
+//TX:
+// ================== TX (ESP32-WROOM) ==================
+// - Phase 1: Send "Hi" every 200ms (RSSI scan)
+// - Phase 2: Send sensor data (40 packets)
+// - Phase 3: Receive image over TCP and forward via LoRa in chunks with ACK/retries
+
+#include <HardwareSerial.h>
+#include <WiFi.h>
+#include "FS.h"
+#include "SPIFFS.h"
+#include <Wire.h>
+#include <Adafruit_BMP280.h>
+#include <DHT.h>
+
+// --- WiFi & TCP Server Config ---
+const char* ssid = "Airtel";
+const char* password = "saherali";
+const uint16_t listen_port = 12345;
+WiFiServer tcpServer(listen_port);
+
+// === GY-91 (MPU9250 + BMP280) ===
+#define MPU_ADDR 0x68
+#define BMP_ADDR 0x76
+Adafruit_BMP280 bmp;
+
+// === DHT11 ===
+#define DHT_PIN 14
+#define DHT_TYPE DHT11
+DHT dht(DHT_PIN, DHT_TYPE);
+
+// === LoRa UART ===
+#define LORA_RX 4
+#define LORA_TX 5
+HardwareSerial LoRaSerial(1); // UART1
+
+// --- Reyax config ---
+const unsigned long REYAX_BAUD = 115200;
+const uint16_t REYAX_TX_ADDR = 7;
+const uint16_t REYAX_DST_ADDR = 12;
+const size_t CHUNK_RAW = 10;            // bytes per chunk
+const unsigned long ACK_TIMEOUT_MS = 8000UL;
+const uint8_t MAX_RETRIES = 5;
+
+// --- Timing and State Management ---
+unsigned long lastSend = 0;
+const unsigned long hiInterval = 200;       // send "Hi" every 200ms
+const unsigned long sensorInterval = 1000;  // sensor packets every 1s
+bool sendingHi = true;
+bool sendingSensorData = false;
+bool awaitingImage = false;
+int sensorPacketsSent = 0;
+const int maxSensorPackets = 40;
+
+// ======================================================
+// === Sensor Read Function ===
+String readSensorString() {
+  // --- Read MPU accel+gyro ---
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B);
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 14, true);
+
+  int16_t AcX = Wire.read() << 8 | Wire.read();
+  int16_t AcY = Wire.read() << 8 | Wire.read();
+  int16_t AcZ = Wire.read() << 8 | Wire.read();
+  Wire.read(); Wire.read();
+  int16_t GyX = Wire.read() << 8 | Wire.read();
+  int16_t GyY = Wire.read() << 8 | Wire.read();
+  int16_t GyZ = Wire.read() << 8 | Wire.read();
+
+  float Ax = AcX / 16384.0;
+  float Ay = AcY / 16384.0;
+  float Az = AcZ / 16384.0;
+  float Gx = GyX / 131.0;
+  float Gy = GyY / 131.0;
+  float Gz = GyZ / 131.0;
+
+  // --- BMP280 ---
+  float temperature = bmp.readTemperature();
+  float pressure = bmp.readPressure() / 100.0F;
+  float altitude = bmp.readAltitude(1013.25);
+
+  // --- DHT11 ---
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  String output = String(Ax, 2) + "," + String(Ay, 2) + "," + String(Az, 2) + ",";
+  output += String(Gx, 2) + "," + String(Gy, 2) + "," + String(Gz, 2) + ",";
+  output += String(temperature, 1) + "," + String(pressure, 1) + "," + String(altitude, 1) + ",";
+  output += String(t, 1) + "," + String(h, 1);
+
+  return output;
+}
+
+// ======================================================
+// === LoRa Communication Functions ===
+void flushReyaxInput() { while (LoRaSerial.available()) LoRaSerial.read(); }
+
+bool sendATCommand(const String &cmd, unsigned long timeout=1000) {
+  flushReyaxInput();
+  LoRaSerial.print(cmd); LoRaSerial.print("\r\n");
+  unsigned long t0 = millis();
+  String resp = "";
+  while (millis() - t0 < timeout) {
+    while (LoRaSerial.available()) {
+      char c = (char)LoRaSerial.read();
+      resp += c;
+      if (resp.endsWith("\r\nOK\r\n")) return true;
+      if (resp.indexOf("ERROR") >= 0) return false;
+    }
+  }
+  return false;
+}
+
+String toHex(const uint8_t *data, size_t len) {
+  static const char hexchars[] = "0123456789ABCDEF";
+  String s; s.reserve(len*2+4);
+  for(size_t i=0;i<len;i++){uint8_t b=data[i]; s+=hexchars[b>>4]; s+=hexchars[b&0x0F];}
+  return s;
+}
+
+// Wait for ACK:<seq> from RX
+bool waitForACK(uint16_t seq, unsigned long timeoutMs) {
+  unsigned long t0 = millis();
+  String incoming = "";
+  while (millis() - t0 < timeoutMs) {
+    while (LoRaSerial.available()) {
+      char c = (char)LoRaSerial.read();
+      incoming += c;
+      if (incoming.endsWith("\r\n")) {
+        int p = incoming.indexOf("ACK:");
+        if (p >= 0) {
+          String seqStr = incoming.substring(p + 4);
+          seqStr.trim();
+          long rseq = seqStr.toInt();
+          incoming = "";
+          if (rseq == seq) return true;
+        } else {
+          incoming = "";
+        }
+      }
+    }
+    delay(5);
+  }
+  return false;
+}
+
+void setupReyax() {
+  LoRaSerial.begin(REYAX_BAUD, SERIAL_8N1, LORA_RX, LORA_TX);
+  delay(100);
+  sendATCommand("AT+ADDRESS=" + String(REYAX_TX_ADDR), 1500);
+  flushReyaxInput();
+}
+
+void sendLoRaPacket(const String &payload) {
+  String cmd = "AT+SEND=" + String(REYAX_DST_ADDR) + "," + String(payload.length()) + "," + payload;
+  LoRaSerial.print(cmd); LoRaSerial.print("\r\n");
+  Serial.println("Sent packet: " + payload);
+}
+
+// --- File sender (with retries) ---
+void sendFileOverLoRa(const char *path) {
+  File f = SPIFFS.open(path, FILE_READ);
+  if (!f) { Serial.println("Failed to open file"); return; }
+  size_t total = f.size();
+  Serial.printf("Sending file size: %u bytes\n", (unsigned) total);
+
+  // Notify RX
+  sendLoRaPacket("HDR:" + String(total));
+  delay(500);
+
+  uint8_t buf[CHUNK_RAW];
+  uint16_t seq = 0;
+  size_t sentBytes = 0;
+
+  while (sentBytes < total) {
+    size_t toRead = min(CHUNK_RAW, total - sentBytes);
+    size_t r = f.read(buf, toRead);
+    if (r == 0) break;
+
+    String hexstr = toHex(buf, r);
+    char seqStr[8]; sprintf(seqStr, "%04u", seq);
+    String packet = "H:" + String(seqStr) + ":" + hexstr;
+
+    bool acked = false;
+    for (uint8_t attempt=1; attempt<=MAX_RETRIES; attempt++) {
+      String cmd = "AT+SEND=" + String(REYAX_DST_ADDR) + "," + String(packet.length()) + "," + packet;
+      LoRaSerial.print(cmd); LoRaSerial.print("\r\n");
+      Serial.println("Sent image packet: " + packet);
+      if (waitForACK(seq, ACK_TIMEOUT_MS)) { acked = true; break; }
+      Serial.printf("Retry %d for seq %u\n", attempt, seq);
+      delay(200);
+    }
+    if (!acked) {
+      Serial.printf("Chunk %u failed after %d retries. Abort.\n", seq, MAX_RETRIES);
+      f.close();
+      return;
+    }
+    sentBytes += r;
+    seq++;
+    delay(30);
+  }
+  sendLoRaPacket("END");
+  Serial.println("Sent END");
+  f.close();
+}
+
+// ======================================================
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  dht.begin();
+
+  // Wake up MPU
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B);
+  Wire.write(0);
+  Wire.endTransmission(true);
+
+  if (!bmp.begin(BMP_ADDR)) {
+    Serial.println("BMP280 not found!");
+    while (1);
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  unsigned long startAttemptTime = millis();
+  const unsigned long wifiTimeout = 15000;
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < wifiTimeout) {
+    delay(300);
+    Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.printf("\nConnected. IP: %s\n", WiFi.localIP().toString().c_str());
+  } else {
+    Serial.println("\nWiFi connection failed. Halting.");
+    while (true) delay(1000);
+  }
+
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed. Halting.");
+    while (true) delay(1000);
+  }
+
+  setupReyax();
+  tcpServer.begin();
+  Serial.println("🚀 LoRa TX & WebServer Started");
+}
+
+// ======================================================
+// === Main Loop ===
+void loop() {
+  unsigned long now = millis();
+
+  // --- Phase 1: Send "Hi" ---
+  if (sendingHi) {
+    if (now - lastSend >= hiInterval) {
+      lastSend = now;
+      sendLoRaPacket("Hi");
+    }
+    static unsigned long hiStart = millis();
+    if (millis() - hiStart >= 20000) {
+      sendingHi = false;
+      sendingSensorData = true;
+      lastSend = 0;
+      Serial.println("✅ Switching to sensor data transmission...");
+      delay(2000);
+    }
+  }
+
+  // --- Phase 2: Send sensor data ---
+  else if (sendingSensorData) {
+    if (sensorPacketsSent < maxSensorPackets) {
+      if (now - lastSend >= sensorInterval) {
+        lastSend = now;
+        String payload = readSensorString();
+        sendLoRaPacket(payload);
+        sensorPacketsSent++;
+      }
+    } else {
+      sendingSensorData = false;
+      awaitingImage = true;
+      Serial.println("✅ Finished sending sensor data. Awaiting image upload...");
+    }
+  }
+
+  // --- Phase 3: Receive image and send over LoRa ---
+  else if (awaitingImage) {
+    WiFiClient client = tcpServer.available();
+    if (client) {
+      Serial.println("📸 Receiving image via TCP...");
+      File file = SPIFFS.open("/to_send.jpg", FILE_WRITE);
+      if (!file) { client.stop(); return; }
+      uint8_t buffer[1024];
+      size_t totalBytes = 0;
+      unsigned long lastRecv = millis();
+      while (client.connected()) {
+        while (client.available()) {
+          size_t br = client.read(buffer, sizeof(buffer));
+          if (br > 0) {
+            file.write(buffer, br);
+            totalBytes += br;
+            lastRecv = millis();
+          }
+        }
+        if (millis() - lastRecv > 2000) break;
+        delay(10);
+      }
+      file.close();
+      client.stop();
+      Serial.printf("✅ TCP received %u bytes\n", (unsigned) totalBytes);
+      sendFileOverLoRa("/to_send.jpg");
+      awaitingImage = false;
+      Serial.println("Image transmission complete. Restarting cycle...");
+      sendingHi = true;
+      sensorPacketsSent = 0;
+    }
+  }
+}
+
+
+
+
+
+// RX (DevKit) - receive chunked image via Reyax LoRa and save to SD (then display on TFT)
+#include <HardwareSerial.h>
+#include <ESP32Servo.h>
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
+#include <SD.h>
+#include <JPEGDecoder.h>
+
+// === LoRa Serial ===
+HardwareSerial LoRaSerial(1); // For the sensor data part
+HardwareSerial &reyax = Serial2; // For the image data part
+const unsigned long REYAX_BAUD = 115200;
+const uint8_t REYAX_ADDR = 12; // this RX module's Reyax address
+const uint8_t REYAX_TX_ADDR = 7; // remote (TX) Reyax address to reply ACKs
+const int REYAX_RX_PIN = 16; // Reyax TX -> ESP RX
+const int REYAX_TX_PIN = 17; // Reyax RX <- ESP TX
+
+// === Servo ===
+Servo antennaServo;
+#define SERVO_PIN 13
+
+// === LoRa UART Pins ===
+#define LORA_RX 16
+#define LORA_TX 17
+
+// === TFT Display Pins ===
+#define TFT_CS 5
+#define TFT_DC 2
+#define TFT_RST 4
+#define SD_CS 14
+
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC, TFT_RST);
+
+// === Reyax config ===
+const uint16_t REYAX_TX_ADDR_SENSOR = 7; // TX address from the sensor data snippet
+const uint16_t REYAX_DST_ADDR = 12; // RX address from the sensor data snippet
+
+// === Servo Scan Settings ===
+const int stepAngle = 15;
+const int scanDelay = 2000;
+int bestRSSI = -999;
+int bestAngle = 0;
+
+int packetCount = 0;
+const int maxPackets = 12; // between 10 and 15
+
+// === Image receiving state ===
+bool receiving = false;
+uint32_t expectedSize = 0;
+uint32_t receivedBytes = 0;
+String partialLine = "";
+const char *SD_IMG_PATH = "/IM.JPG";
+const size_t CHUNK_RAW = 10;
+#define MAX_CHUNKS 2048 // adjust if you expect bigger images
+bool seqReceived[MAX_CHUNKS] = {false};
+
+// --- LoRa Functions ---
+void sendLoRaPacket(const String& payload) {
+  String cmd = "AT+SEND=" + String(REYAX_DST_ADDR) + "," + String(payload.length()) + "," + payload;
+  LoRaSerial.print(cmd);
+  LoRaSerial.print("\r\n");
+  Serial.println("Sent: " + payload);
+}
+
+// --- Reyax Functions ---
+void setupReyax() {
+  reyax.begin(REYAX_BAUD, SERIAL_8N1, REYAX_RX_PIN, REYAX_TX_PIN);
+  delay(150);
+  Serial.println("Setting Reyax address (RX side)...");
+  reyax.print(String("AT+ADDRESS=") + REYAX_ADDR + "\r\n");
+  delay(300);
+  unsigned long t0 = millis();
+  while (millis() - t0 < 500) {
+    while (reyax.available()) {
+      String s = reyax.readStringUntil('\n');
+      s.trim();
+      if (s.length()) Serial.print("REYAX INIT: "), Serial.println(s);
+    }
+  }
+}
+
+void sendLoRaASCII(const String &payload) {
+  String cmd = "AT+SEND=" + String(REYAX_TX_ADDR) + "," + String(payload.length()) + "," + payload;
+  Serial.printf(">> REYAX SEND: %s\n", cmd.c_str());
+  reyax.print(cmd + "\r\n");
+  unsigned long t0 = millis();
+  while (millis() - t0 < 300) {
+    while (reyax.available()) {
+      char c = (char)reyax.read();
+      Serial.write(c);
+    }
+  }
+}
+
+// Convert hex string to bytes in-place into buffer
+size_t hexToBytesToSD(const String &hex, File &f) {
+  size_t L = hex.length();
+  if (L % 2 != 0) {
+    Serial.println("hexToBytesToSD: odd len");
+    return 0;
+  }
+  size_t outLen = 0;
+  for (size_t i = 0; i < L; i += 2) {
+    char a = hex.charAt(i);
+    char b = hex.charAt(i + 1);
+    char tmp[3] = { a, b, 0 };
+    uint8_t val = (uint8_t) strtol(tmp, NULL, 16);
+    f.write(val);
+    outLen++;
+  }
+  return outLen;
+}
+
+// Draw a simple progress bar
+void drawProgressBar() {
+  int barX = 10;
+  int barY = tft.height() - 40;
+  int barW = tft.width() - 30;
+  int barH = 20;
+
+  tft.fillRect(barX, barY, barW, barH, ILI9341_WHITE);
+  tft.drawRect(barX, barY, barW, barH, ILI9341_MAGENTA);
+
+  if (expectedSize > 0) {
+    float pct = (float)receivedBytes / expectedSize;
+    int fillW = (int)(barW * pct);
+    tft.fillRect(barX + 1, barY + 1, fillW, barH - 2, ILI9341_BLUE);
+  }
+}
+
+// Draw receiving progress on TFT (text-based)
+void drawReceivingScreen() {
+  tft.fillScreen(ILI9341_PINK);
+  tft.setCursor(10, 20);
+  tft.setTextSize(2);
+  tft.setTextColor(ILI9341_BLACK);
+  tft.println("Receiving image...");
+  tft.setTextSize(1);
+  tft.setCursor(10, 60);
+  tft.print("Expected: ");
+  tft.print(expectedSize);
+  tft.println(" bytes");
+  tft.setCursor(10, 80);
+  tft.print("Received: ");
+  tft.print(receivedBytes);
+  tft.println(" bytes");
+  uint32_t chunks = (expectedSize + CHUNK_RAW - 1) / CHUNK_RAW;
+  tft.setCursor(10, 100);
+  tft.print("Chunks total: ");
+  tft.println(chunks);
+  tft.setCursor(10, 120);
+  tft.print("Progress: ");
+  if (expectedSize > 0) {
+    int pct = (int)((receivedBytes * 100) / expectedSize);
+    tft.print(pct);
+    tft.println("%");
+  } else {
+    tft.println("0%");
+  }
+  drawProgressBar();
+}
+
+// After file saved to SD, decode and render it
+void renderSavedJpeg() {
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(10, 10);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextSize(2);
+  tft.println("Rendering image...");
+  delay(200);
+
+  File jpegFile = SD.open(SD_IMG_PATH, FILE_READ);
+  if (!jpegFile) {
+    Serial.println("Saved file not found on SD!");
+    tft.setCursor(10, 40);
+    tft.println("No IMG on SD");
+    return;
+  }
+
+  if (JpegDec.decodeSdFile(jpegFile)) {
+    uint16_t imgW = JpegDec.width;
+    uint16_t imgH = JpegDec.height;
+    float scaleX = (float)tft.width() / imgW;
+    float scaleY = (float)tft.height() / imgH;
+    uint32_t drawTime = millis();
+
+    while (JpegDec.read()) {
+      uint16_t *pImg = JpegDec.pImage;
+      uint16_t mcuW = JpegDec.MCUWidth;
+      uint16_t mcuH = JpegDec.MCUHeight;
+      for (int y = 0; y < mcuH; y++) {
+        for (int x = 0; x < mcuW; x++) {
+          int imgX = JpegDec.MCUx * mcuW + x;
+          int imgY = JpegDec.MCUy * mcuH + y;
+          if (imgX >= imgW || imgY >= imgH) continue;
+          uint16_t color = pImg[y * mcuW + x];
+          int screenX = imgX * scaleX;
+          int screenY = imgY * scaleY;
+          tft.fillRect(screenX, screenY, scaleX + 1, scaleY + 1, color);
+        }
+      }
+    }
+    Serial.print("JPEG drawn in ");
+    Serial.print(millis() - drawTime);
+    Serial.println(" ms");
+  } else {
+    Serial.println("JPEG decode failed!");
+    tft.setCursor(10, 40);
+    tft.setTextColor(ILI9341_RED);
+    tft.println("Decode failed!");
+  }
+  jpegFile.close();
+}
+
+// Parse +RCV lines and handle HDR/H:/END payloads
+void handleReyaxLine(const String &lineIn) {
+  String line = lineIn;
+  line.trim();
+  if (line.length() == 0) return;
+  Serial.printf("REYAX LINE: %s\n", line.c_str());
+
+  int eqPos = line.indexOf('=');
+  if (eqPos < 0) return;
+
+  int c1 = line.indexOf(',', eqPos + 1);
+  int c2 = line.indexOf(',', c1 + 1);
+  int c3 = line.indexOf(',', c2 + 1);
+  if (c1 < 0 || c2 < 0) return;
+
+  String payload;
+  if (c3 >= 0) payload = line.substring(c2 + 1, c3);
+  else payload = line.substring(c2 + 1);
+  payload.trim();
+
+  if (payload.length() == 0) return;
+
+  // HDR:
+  if (payload.startsWith("HDR:")) {
+    expectedSize = (uint32_t) payload.substring(4).toInt();
+    Serial.printf("HDR received. Expecting %u bytes. Creating SD file...\n", expectedSize);
+    if (SD.exists(SD_IMG_PATH)) SD.remove(SD_IMG_PATH);
+    File f = SD.open(SD_IMG_PATH, FILE_WRITE);
+    if (!f) {
+      Serial.println("Failed to open SD image for writing!");
+      receiving = false;
+      return;
+    }
+    f.close();
+    receiving = true;
+    receivedBytes = 0;
+    for (uint16_t i = 0; i < MAX_CHUNKS; i++) seqReceived[i] = false;
+    drawReceivingScreen();
+  }
+  // END
+  else if (payload == "END") {
+    Serial.println("END received. Closing SD file.");
+    receiving = false;
+    Serial.printf("Total written: %u bytes. File saved to %s\n", receivedBytes, SD_IMG_PATH);
+    tft.fillScreen(ILI9341_GREEN);
+    tft.setCursor(10, 10);
+    tft.setTextSize(2);
+    tft.setTextColor(ILI9341_BLACK);
+    tft.println("Image Received!");
+    drawProgressBar();
+    delay(400);
+    renderSavedJpeg();
+  }
+  // H: packet with seq and hexdata
+  else if (payload.startsWith("H:")) {
+    int secondColon = payload.indexOf(':', 2);
+    if (secondColon < 0) return;
+    String seqStr = payload.substring(2, secondColon);
+    String hexdata = payload.substring(secondColon + 1);
+    uint16_t seq = (uint16_t) seqStr.toInt();
+
+    if (receiving && seq < MAX_CHUNKS && !seqReceived[seq]) {
+      seqReceived[seq] = true;
+      if (hexdata.length() > 0) {
+        File f = SD.open(SD_IMG_PATH, FILE_APPEND);
+        if (!f) {
+          Serial.println("Failed to open SD append!");
+          return;
+        }
+        size_t outLen = hexToBytesToSD(hexdata, f);
+        f.flush();
+        f.close();
+        receivedBytes += outLen;
+        Serial.printf("Wrote seq %u bytes=%u total=%u\n", seq, (unsigned)outLen, (unsigned)receivedBytes);
+        drawReceivingScreen();
+      }
+    }
+    String ack = String("ACK:") + String(seq);
+    sendLoRaASCII(ack);
+    Serial.printf("ACK sent for seq %u\n", seq);
+  }
+  // Sensor data
+  else {
+    Serial.printf("Other payload: %s\n", payload.c_str());
+    if (line.startsWith("+RCV")) {
+      int firstComma = line.indexOf(',');
+      int secondComma = line.indexOf(',', firstComma + 1);
+      if (firstComma > 0 && secondComma > 0) {
+        String sensorPayload = line.substring(secondComma + 1);
+        packetCount++;
+        displaySensorPayload(sensorPayload);
+      }
+    }
+  }
+}
+
+// === RSSI Scan ===
+void scanRSSI() {
+ bestRSSI = -999;
+  bestAngle = 0;
+
+  for (int angle = 0; angle <= 180; angle += stepAngle) {
+    antennaServo.write(angle);
+    Serial.println("🔄 Scanning Angle: " + String(angle) + "°");
+    delay(scanDelay);
+
+    int currentRSSI = -999; 
+    String msg = "";
+
+    unsigned long timeout = millis() + 2500;
+    while (millis() < timeout) {
+      if (LoRaSerial.available()) {
+        msg = LoRaSerial.readStringUntil('\n');
+        msg.trim();
+        Serial.println("📩 " + msg);
+
+        // === Parse +RCV ===
+        if (msg.startsWith("+RCV")) {
+          int commas[5], count = 0;
+          for (int i = 0; i < msg.length(); i++) {
+            if (msg.charAt(i) == ',' && count < 4) commas[count++] = i;
+          }
+
+          if (count >= 4) {
+            String rssiStr = msg.substring(commas[2] + 1, commas[3]);
+            currentRSSI = rssiStr.toInt();
+            Serial.println("📶 RSSI: " + String(currentRSSI));
+
+            if (currentRSSI > bestRSSI) {
+              bestRSSI = currentRSSI;
+              bestAngle = angle;
+              Serial.println("✨ New Best → " + String(bestRSSI) + " dBm at " + String(bestAngle) + "°");
+            }
+          }
+          break;
+        }
+      }
+    }
+
+    // === Update TFT with angle info ===
+    tft.fillRect(0, 60, 240, 90, ILI9341_BLACK);
+    tft.setCursor(10, 70);
+    tft.setTextColor(ILI9341_YELLOW);
+    tft.setTextSize(2);
+    tft.println("Angle: " + String(angle) + "°");
+
+    tft.setCursor(10, 100);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.println("RSSI: " + String(currentRSSI));
+  }
+
+  // === Final Result ===
+  Serial.println("🏁 Best Angle: " + String(bestAngle) + "° | Best RSSI: " + String(bestRSSI));
+  antennaServo.write(bestAngle);
+
+  tft.fillRect(0, 160, 240, 70, ILI9341_BLACK);
+  tft.setCursor(10, 170);
+  tft.setTextColor(ILI9341_GREEN);
+  tft.setTextSize(2);
+  tft.println("Best Angle: " + String(bestAngle) + "°");
+
+  tft.setCursor(10, 200);
+  tft.setTextColor(ILI9341_MAGENTA);
+  tft.println("Best RSSI: " + String(bestRSSI));
+
+  delay(8000); // Wait before rescanning
+}
+
+// === Helper to parse and display payload ===
+void displaySensorPayload(String payload) {
+  String fields[11];
+  int fieldIndex = 0;
+  int lastComma = -1;
+
+  for (int i = 0; i < payload.length() && fieldIndex < 11; i++) {
+    if (payload.charAt(i) == ',') {
+      fields[fieldIndex] = payload.substring(lastComma + 1, i);
+      lastComma = i;
+      fieldIndex++;
+    }
+  }
+  if (fieldIndex < 11) {
+    fields[fieldIndex] = payload.substring(lastComma + 1);
+  }
+
+  tft.fillRect(0, 80, 240, 140, ILI9341_BLACK);
+  tft.setCursor(10, 90);
+  tft.setTextColor(ILI9341_YELLOW);
+  tft.setTextSize(2);
+  tft.println("Pkt " + String(packetCount));
+
+  tft.setCursor(10, 120);
+  tft.setTextColor(ILI9341_WHITE);
+  tft.setTextSize(1);
+  tft.println("Accel: X=" + fields[0] + " Y=" + fields[1] + " Z=" + fields[2]);
+
+  tft.setCursor(10, 140);
+  tft.println("Gyro: X=" + fields[3] + " Y=" + fields[4] + " Z=" + fields[5]);
+
+  tft.setCursor(10, 160);
+  tft.println("BMP: T=" + fields[6] + " P=" + fields[7] + " A=" + fields[8]);
+
+  tft.setCursor(10, 180);
+  tft.println("DHT: T=" + fields[9] + " H=" + fields[10]);
+}
+
+// === Setup ===
+void setup() {
+  Serial.begin(115200);
+  delay(50);
+  Serial.println("\nRX (TFT) starting...");
+
+  // TFT init
+  tft.begin();
+  tft.setRotation(1);
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.println("RX System Booting...");
+
+  // SD init
+  if (!SD.begin(SD_CS)) {
+    Serial.println("SD card init failed!");
+    tft.setCursor(10, 40);
+    tft.setTextColor(ILI9341_RED);
+    tft.setTextSize(2);
+    tft.println("SD init failed!");
+    while (1) delay(1000);
+  } else {
+    Serial.println("SD initialized.");
+  }
+
+  // Reyax init
+  setupReyax();
+
+  // Servo init
+  antennaServo.attach(SERVO_PIN);
+  
+  // Ready screen
+  tft.fillScreen(ILI9341_BLACK);
+  tft.setCursor(10, 10);
+  tft.setTextColor(ILI9341_CYAN);
+  tft.setTextSize(2);
+  tft.println("RX Ready - Waiting for LoRa");
+}
+
+// === Loop ===
+void loop() {
+  if (packetCount == 0) {
+    scanRSSI();
+    tft.fillScreen(ILI9341_BLACK);
+    tft.setCursor(20, 40);
+    tft.setTextColor(ILI9341_CYAN);
+    tft.setTextSize(2);
+    tft.println("Entering Data Rx Mode...");
+  }
+  
+  while (reyax.available()) {
+    char c = (char) reyax.read();
+    Serial.write(c);
+    if (c == '\n') {
+      String line = partialLine;
+      line.trim();
+      if (line.length() > 0) handleReyaxLine(line);
+      partialLine = "";
+    } else if (c != '\r') {
+      partialLine += c;
+      if (partialLine.length() > 1200) partialLine = "";
+    }
+  }
+
+  // The sensor data part is now integrated into handleReyaxLine,
+  // so no need to duplicate this logic here. The `if (LoRaSerial.available())`
+  // check from the original snippet is now redundant since both data types
+  // come from the same physical serial port.
+  
+  delay(5);
+}
