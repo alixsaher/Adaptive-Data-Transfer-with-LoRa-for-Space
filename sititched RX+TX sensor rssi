@@ -182,7 +182,7 @@ void displaySensorPayload(String payload) {
   tft.println("DHT:   T=" + fields[9] + " H=" + fields[10]);
 }
 
-// === Loop ==
+// === Loop ===
 void loop() {
   if (packetCount == 0) {
     scanRSSI();
@@ -213,10 +213,18 @@ void loop() {
         delay(2000);  // Keep display for 2 seconds
       }
     }
+  } else {
+    // No LoRa data → show Capturing screen
+    tft.fillScreen(ILI9341_PINK);
+    tft.setCursor(40, 100);
+    tft.setTextColor(ILI9341_WHITE);
+    tft.setTextSize(3);
+    tft.println("Capturing...");
+    delay(7000); 
   }
 }
 
-
+------------------------------------------------------------------------------------------------------------------------------------------
 
 //TX
 
@@ -266,7 +274,7 @@ bool sendingHi = true;
 bool sendingSensorData = false;
 bool awaitingImage = false;
 int sensorPacketsSent = 0;
-const int maxSensorPackets = 25;
+const int maxSensorPackets = 40;
 
 // --- Sensor Read Function ---
 String readSensorString() {
