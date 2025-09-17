@@ -217,7 +217,6 @@ void loop() {
 
 
 
-//RX
 // RX (DevKit) - receive chunked image via Reyax LoRa and save to SD (then display on TFT)
 #include <HardwareSerial.h>
 #include <SPI.h>
@@ -306,7 +305,30 @@ size_t hexToBytesToSD(const String &hex, File &f) {
   return outLen;
 }
 
-// Draw receiving progress on TFT
+// Draw a simple progress bar
+void drawProgressBar() {
+  int barX = 10;
+  int barY = tft.height() - 30;  // bottom area
+  int barW = tft.width() - 20;
+  int barH = 20;
+
+  // Background bar (white)
+  tft.fillRect(barX, barY, barW, barH, ILI9341_WHITE);
+
+  // Outline (black)
+  tft.drawRect(barX, barY, barW, barH, ILI9341_BLACK);
+
+  // Fill progress (blue)
+  if (expectedSize > 0) {
+    float pct = (float)receivedBytes / expectedSize;
+    int fillW = (int)(barW * pct);
+    tft.fillRect(barX + 1, barY + 1, fillW, barH - 2, ILI9341_BLUE);
+
+    Serial.printf("Progress bar fillW = %d / %d (%.1f%%)\n", fillW, barW, pct * 100);
+  }
+}
+
+// Draw receiving progress on TFT (this is the original text-based one)
 void drawReceivingScreen() {
   tft.fillScreen(ILI9341_PINK);
   tft.setCursor(10, 20);
@@ -335,6 +357,8 @@ void drawReceivingScreen() {
   } else {
     tft.println("0%");
   }
+  // This is where we will now add a call to the progress bar function
+  drawProgressBar();
 }
 
 // After file saved to SD, decode and render it
@@ -355,7 +379,6 @@ void renderSavedJpeg() {
   }
 
   if (JpegDec.decodeSdFile(jpegFile)) {
-    // zoom/draw code from your snippet
     uint16_t imgW = JpegDec.width;
     uint16_t imgH = JpegDec.height;
     float scaleX = (float)tft.width() / imgW;
@@ -418,7 +441,6 @@ void handleReyaxLine(const String &lineIn) {
   if (payload.startsWith("HDR:")) {
     expectedSize = (uint32_t) payload.substring(4).toInt();
     Serial.printf("HDR received. Expecting %u bytes. Creating SD file...\n", expectedSize);
-    // remove existing file
     if (SD.exists(SD_IMG_PATH)) SD.remove(SD_IMG_PATH);
     File f = SD.open(SD_IMG_PATH, FILE_WRITE);
     if (!f) {
@@ -429,21 +451,19 @@ void handleReyaxLine(const String &lineIn) {
     f.close();
     receiving = true;
     receivedBytes = 0;
-    // draw initial receiving screen
     drawReceivingScreen();
   }
   // END
   else if (payload == "END") {
     Serial.println("END received. Closing SD file.");
     receiving = false;
-    // ensure file closed and flush (we write per chunk so file will be closed)
     Serial.printf("Total written: %u bytes. File saved to %s\n", receivedBytes, SD_IMG_PATH);
-    // update TFT
     tft.fillScreen(ILI9341_GREEN);
     tft.setCursor(10, 10);
     tft.setTextSize(2);
     tft.setTextColor(ILI9341_BLACK);
     tft.println("Image Received!");
+    drawProgressBar(); // Draw final full bar
     delay(400);
     renderSavedJpeg();
   }
@@ -469,12 +489,10 @@ void handleReyaxLine(const String &lineIn) {
       // update TFT progress
       drawReceivingScreen();
     }
-    // send ACK back
     String ack = String("ACK:") + String(seq);
     sendLoRaASCII(ack);
     Serial.printf("ACK sent for seq %u\n", seq);
   }
-  // else: payload might be sensor data or "Hi" beacons; ignore or log
   else {
     Serial.printf("Other payload: %s\n", payload.c_str());
   }
@@ -485,7 +503,6 @@ void setup() {
   delay(50);
   Serial.println("\nRX (TFT) starting...");
 
-  // TFT init
   tft.begin();
   tft.setRotation(1);
   tft.fillScreen(ILI9341_BLACK);
@@ -494,7 +511,6 @@ void setup() {
   tft.setCursor(10, 10);
   tft.println("RX System Booting...");
 
-  // SD init
   if (!SD.begin(SD_CS)) {
     Serial.println("SD card init failed!");
     tft.setCursor(10, 40);
@@ -506,10 +522,8 @@ void setup() {
     Serial.println("SD initialized.");
   }
 
-  // Reyax
   setupReyax();
 
-  // ready screen
   tft.fillScreen(ILI9341_BLACK);
   tft.setCursor(10, 10);
   tft.setTextColor(ILI9341_CYAN);
@@ -518,10 +532,9 @@ void setup() {
 }
 
 void loop() {
-  // Read Reyax incoming bytes and build lines (line terminated by '\n')
   while (reyax.available()) {
     char c = (char) reyax.read();
-    Serial.write(c); // echo to Serial debug
+    Serial.write(c);
     if (c == '\n') {
       String line = partialLine;
       line.trim();
@@ -529,9 +542,7 @@ void loop() {
       partialLine = "";
     } else if (c != '\r') {
       partialLine += c;
-      if (partialLine.length() > 1200) partialLine = ""; // safety
+      if (partialLine.length() > 1200) partialLine = "";
     }
   }
-
-  delay(5);
 }
