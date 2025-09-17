@@ -961,37 +961,44 @@ void setup() {
 }
 
 // === Loop ===
+// === Global flag ===
+bool systemHalted = false;
+
+// === Loop ===
 void loop() {
+  if (systemHalted) {
+    // Do absolutely nothing, freeze system in last state
+    return;
+  }
+
+  // Phase 1: one-time RSSI scan
   if (packetCount == 0) {
     scanRSSI();
+    packetCount = 1; // mark scan done
     tft.fillScreen(ILI9341_BLACK);
     tft.setCursor(20, 40);
     tft.setTextColor(ILI9341_CYAN);
     tft.setTextSize(2);
     tft.println("Entering Data Rx Mode...");
   }
-  
+
+  // Phase 2: Handle incoming LoRa data
   while (reyax.available()) {
-    char c = (char) reyax.read();
-    Serial.write(c);
-    if (c == '\n') {
-      String line = partialLine;
-      line.trim();
-      if (line.length() > 0) handleReyaxLine(line);
-      partialLine = "";
-    } else if (c != '\r') {
-      partialLine += c;
-      if (partialLine.length() > 1200) partialLine = "";
+    String msg = reyax.readStringUntil('\n');
+    msg.trim();
+    if (msg.length() > 0) {
+      handleReyaxLine(msg);
+
+      // If image completed OR decode failed, stop forever
+      if (!receiving && expectedSize > 0) {
+        Serial.println("Halting system after image transfer.");
+        systemHalted = true;
+        return;
+      }
     }
   }
-
-  // The sensor data part is now integrated into handleReyaxLine,
-  // so no need to duplicate this logic here. The `if (LoRaSerial.available())`
-  // check from the original snippet is now redundant since both data types
-  // come from the same physical serial port.
-  
-  delay(5);
 }
+
 
 -----------------------------------------------------------------------------------------------------------------------------------------------
 
